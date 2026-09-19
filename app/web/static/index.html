@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>知识问答助手</title>
+  <link rel="stylesheet" href="/static/style.css?v=6">
+</head>
+
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="logo">
+        <div class="logo-mark">✦</div>
+        <h1>知识问答助手</h1>
+      </div>
+
+      <button id="newSessionBtn" class="primary new-session-btn">＋ 新建会话</button>
+
+      <section class="panel">
+        <h2>会话列表</h2>
+        <ul id="sessionList" class="session-list"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>知识库（<span id="docCount">0</span>）</h2>
+        <ul id="docList" class="doc-list"></ul>
+        <p class="hint">把 HTML / TXT / Markdown 知识文件放入 <code>data/</code> 目录，重启服务后自动入库</p>
+      </section>
+    </aside>
+
+    <main class="chat">
+      <div id="messages" class="messages">
+        <div class="msg bot">
+          <div class="avatar">✦</div>
+          <div class="msg-body">
+            <div class="answer-text">你好！知识文件已在服务启动时自动入库，直接基于你的资料提问即可。</div>
+          </div>
+        </div>
+      </div>
+      <div class="input-bar">
+        <div class="input-shell">
+          <textarea id="questionInput" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+          <button id="sendBtn" class="primary">发送</button>
+        </div>
+      </div>
+    </main>
+  </div>
+  <script src="/static/vendor/marked.min.js"></script>
+  <script src="/static/vendor/purify.min.js"></script>
+  <script src="/static/app.js?v=6"></script>
+</body>
+
+</html>
