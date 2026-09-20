@@ -3,7 +3,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic-settings>=2.2       # .env 配置读取
 
-# 大模型（走 OpenAI 兼容接口，当前接 GLM-4.7-Flash）
+# 大模型（走 OpenAI 兼容接口，当前接 DeepSeek）
 openai>=1.30
 
 # RAG：本地 embedding 模型 + 向量库

@@ -13,10 +13,10 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM（OpenAI 兼容接口，当前接 GLM-4.7-Flash；切其他兼容模型只改 .env）
     llm_api_key: str = ""
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4/"
-    llm_model: str = "glm-4.7-flash"
+    # OpenAI 兼容接口；换厂商只改 base_url / model 两个值
+    llm_base_url: str = "https://api.deepseek.com"
+    llm_model: str = "deepseek-chat"
 
     # 本地 embedding 模型（首次运行时自动下载）
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
@@ -30,9 +30,19 @@ class Settings(BaseSettings):
     chunk_overlap: int = 64     # 相邻块之间的重叠字符数
     top_k: int = 4              # 每次检索返回的文本块数量
 
+    # 联网搜索（Tavily）：与 LLM 配置完全独立，换搜索引擎只改 SEARCH_PROVIDER
+    search_provider: str = "tavily"
+    tavily_api_key: str = ""            # 可选：不填不影响启动，触发联网时才报错降级
+    search_max_results: int = 5         # 每次搜索返回的网页数
+    search_depth: str = "advanced"      # basic=1 credit/次；advanced=2 credits，正文更全，可减少二次搜索
+    search_country: str = "china"       # 地域限定（Tavily country 参数），留空则不限
+    search_timeout: float = 15.0        # 搜索请求超时（秒）
+    search_max_rounds: int = 2          # 单次问答最多几轮工具调用（防失控、控延迟）
+    web_search_default: bool = True     # 前端联网开关的默认值
+
     # 会话记忆压缩阈值（token 粗估，见 app/services/memory.py）
     # 超过 window 触发压缩，压到 target 以下为止；target < window 保证每轮压缩确实减负
-    # 当前按 GLM-4.7-Flash 200K 上下文设的保守值；切回 DeepSeek（64K）需相应调小
+    # 取值按 64K 级上下文留足安全余量；切换到更大上下文窗口的模型时可适当调大
     memory_window_tokens: int = 20000  # 近轮原文累计超过此值即触发滚动压缩
     memory_target_tokens: int = 10000  # 压缩后剩余原文回落到的目标值
 

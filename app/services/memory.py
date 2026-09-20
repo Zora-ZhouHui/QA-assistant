@@ -169,7 +169,7 @@ class MemoryService:
     # ---------- 工具 ----------
     @staticmethod
     def _estimate_tokens(messages: List[Dict[str, str]]) -> int:
-        # 中文粗估：GLM tokenizer 约 1 字 ≈ 0.75 token；偏保守，宁可早压不要爆上下文
+        # 中文粗估：主流中英 tokenizer 约 1 字 ≈ 0.75 token；偏保守，宁可早压不要爆上下文
         return int(sum(len(m["content"]) for m in messages) * 0.75)
 
     @staticmethod

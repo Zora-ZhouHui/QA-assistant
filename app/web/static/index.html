@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>知识问答助手</title>
-  <link rel="stylesheet" href="/static/style.css?v=6">
+  <link rel="stylesheet" href="/static/style.css?v=13">
 </head>
 
 <body>
@@ -22,12 +22,6 @@
         <h2>会话列表</h2>
         <ul id="sessionList" class="session-list"></ul>
       </section>
-
-      <section class="panel">
-        <h2>知识库（<span id="docCount">0</span>）</h2>
-        <ul id="docList" class="doc-list"></ul>
-        <p class="hint">把 HTML / TXT / Markdown 知识文件放入 <code>data/</code> 目录，重启服务后自动入库</p>
-      </section>
     </aside>
 
     <main class="chat">
@@ -42,14 +36,30 @@
       <div class="input-bar">
         <div class="input-shell">
           <textarea id="questionInput" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+          <label class="web-toggle" title="允许助手自动联网搜索最新信息">
+            <input type="checkbox" id="webSearchCheck" checked>
+            <span class="web-toggle-track"></span>
+            <span>联网</span>
+          </label>
           <button id="sendBtn" class="primary">发送</button>
         </div>
       </div>
     </main>
+
+    <aside class="log-panel" id="logPanel">
+      <div class="log-header">
+        <h2>执行日志</h2>
+        <button id="logToggle" class="log-toggle-btn" title="收起日志面板">收起</button>
+      </div>
+      <div id="logList" class="log-list">
+        <p class="log-empty">发送问题后，这里会实时显示助手的每一步检索与决策过程</p>
+      </div>
+      <button id="logRail" class="log-rail" title="展开日志面板">执行日志</button>
+    </aside>
   </div>
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/purify.min.js"></script>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=17"></script>
 </body>
 
 </html>

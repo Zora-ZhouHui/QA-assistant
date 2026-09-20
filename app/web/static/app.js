@@ -1,11 +1,10 @@
-// 前端逻辑：会话管理 + 知识库列表 + 基于 SSE 流的问答（含检索资料卡片展示）
+// 前端逻辑：会话管理 + 基于 SSE 流的问答（检索资料卡片 + 右侧执行日志）
 const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('questionInput');
 const sendBtn = document.getElementById('sendBtn');
-const docListEl = document.getElementById('docList');
-const docCountEl = document.getElementById('docCount');
 const sessionListEl = document.getElementById('sessionList');
 const newSessionBtn = document.getElementById('newSessionBtn');
+const webSearchCheck = document.getElementById('webSearchCheck');
 
 // 当前会话 id（存 localStorage，刷新后仍能回到同一会话）
 let currentSessionId = localStorage.getItem('session_id');
@@ -80,6 +79,235 @@ function makeThinking() {
   return el;
 }
 
+// ---------- 右侧执行日志（Agent 决策时间线） ----------
+// 每轮问答按时间顺序记录：提问 → 每次工具调用（类型/序号/检索词/结果数/耗时/结果明细）
+// → 生成回答 → 总耗时。多次搜索时，不同检索词与各自结果数可解释"为什么会调用多次"。
+const logListEl = document.getElementById('logList');
+const LOG_EMPTY = '发送问题后，这里会实时显示助手的每一步检索与决策过程';
+const logPanelEl = document.getElementById('logPanel');
+
+// 收起/展开执行日志面板（状态记忆到 localStorage）：
+// 新建会话/切历史会话 → 自动收起；提问产生日志 → 自动展开；回答中途手动收起不被抢占
+function setLogCollapsed(collapsed) {
+  logPanelEl.classList.toggle('collapsed', collapsed);
+  try { localStorage.setItem('logCollapsed', collapsed ? '1' : '0'); } catch (e) { /* 隐私模式忽略 */ }
+}
+document.getElementById('logToggle').addEventListener('click', () => setLogCollapsed(true));
+document.getElementById('logRail').addEventListener('click', () => setLogCollapsed(false));
+if (localStorage.getItem('logCollapsed') === '1') logPanelEl.classList.add('collapsed');
+
+let activeToolStep = null; // 当前进行中的工具步骤 {el, start}
+let llmStep = null;        // 进行中的"模型调用"步骤 {el}（决策/生成共用，按后续事件定型）
+let answerStep = null;     // 回答步骤 {el, start}
+let toolSeq = 0;           // 本轮工具调用序号（回答"第几次搜索"）
+let llmCalls = 0;          // 本轮模型调用总次数（决策 + 生成）
+let decisionCalls = 0;     // 其中"决策"次数（以调用工具告终的调用）
+let qaStart = 0;           // 本轮问答起始时间
+
+function escapeHtml(s) {
+  return (s || '').replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function nowTime() {
+  return new Date().toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function resetLog() {
+  logListEl.innerHTML = `<p class="log-empty">${LOG_EMPTY}</p>`;
+  activeToolStep = null;
+  answerStep = null;
+  toolSeq = 0;
+  qaStart = 0;
+}
+
+function appendStep(stateClass) {
+  const empty = logListEl.querySelector('.log-empty');
+  if (empty) empty.remove();
+  const step = document.createElement('div');
+  step.className = `log-step ${stateClass}`;
+  step.innerHTML = '<span class="log-node"></span>';
+  logListEl.appendChild(step);
+  logListEl.scrollTop = logListEl.scrollHeight;
+  return step;
+}
+
+function logQuestion(question) {
+  resetLog();
+  qaStart = performance.now();
+  setLogCollapsed(false);  // 日志开始生成 → 自动展开面板
+  const step = appendStep('info');
+  step.innerHTML =
+    '<span class="log-node"></span>' +
+    '<div class="log-head"><span class="log-kind question">提问</span>' +
+    '<span class="log-action">用户问题</span>' +
+    `<span class="log-time">${nowTime()}</span></div>` +
+    `<div class="log-detail">${escapeHtml(question)}</div>`;
+}
+
+// 模型调用开始：Agent 每轮循环先请求一次模型，要么决策调用工具，要么直接生成
+function logLlmStart(callNo) {
+  llmCalls = callNo;
+  const step = appendStep('running');
+  step.innerHTML =
+    '<span class="log-node spin"></span>' +
+    '<div class="log-head"><span class="log-kind model">模型</span>' +
+    '<span class="log-action">第 ' + callNo + ' 次调用 · 推理中</span>' +
+    `<span class="log-time">${nowTime()}</span></div>`;
+  llmStep = { el: step };
+}
+
+// 该次模型调用以"请求调用工具"告终 → 定型为决策步骤
+function logLlmDecision() {
+  if (!llmStep) return;
+  const { el } = llmStep;
+  decisionCalls += 1;
+  el.classList.remove('running');
+  el.classList.add('info');
+  el.querySelector('.log-node').classList.remove('spin');
+  el.querySelector('.log-action').textContent = `第 ${llmCalls} 次调用 · 决策：调用工具`;
+  llmStep = null;
+}
+
+function logToolStart(kind, query) {
+  toolSeq += 1;
+  const step = appendStep('running');
+  const label = kind === 'kb' ? '本地检索' : '联网搜索';
+  step.innerHTML =
+    '<span class="log-node spin"></span>' +
+    '<div class="log-head">' +
+    `<span class="log-kind ${kind}">#${toolSeq} ${label}</span>` +
+    `<span class="log-time">${nowTime()}</span></div>` +
+    `<div class="log-query">检索词 <code>${escapeHtml(query || '')}</code></div>` +
+    '<div class="log-meta">执行中…</div>';
+  activeToolStep = { el: step, start: performance.now(), kind };
+}
+
+function _domain(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function _resultTitle(doc, kind) {
+  if (kind === 'web') return doc.title || doc.source || '(无标题)';
+  return doc.question || doc.source || '(无标题)';
+}
+
+function logToolFinish(docs, kind) {
+  if (!activeToolStep) return;
+  const { el, start } = activeToolStep;
+  const secs = ((performance.now() - start) / 1000).toFixed(1);
+  const list = docs || [];
+
+  el.classList.remove('running');
+  el.classList.add('ok');
+  el.querySelector('.log-node').classList.remove('spin');
+  el.querySelector('.log-meta').textContent = `返回 ${list.length} 条 · 耗时 ${secs}s`;
+
+  if (list.length) {
+    const ul = document.createElement('ul');
+    ul.className = 'log-results';
+    list.forEach(d => {
+      const li = document.createElement('li');
+      const idx = `<span class="log-result-idx">[资料${d.index}]</span>`;
+      if (kind === 'web' && d.source) {
+        li.innerHTML = idx;
+        const a = document.createElement('a');
+        a.href = d.source;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = _resultTitle(d, kind);
+        li.appendChild(a);
+        const src = document.createElement('span');
+        src.className = 'log-result-src';
+        src.textContent = _domain(d.source);
+        li.appendChild(src);
+      } else {
+        li.innerHTML = idx + escapeHtml(_resultTitle(d, kind));
+      }
+      ul.appendChild(li);
+    });
+
+    const toggle = document.createElement('button');
+    toggle.className = 'log-results-toggle';
+    toggle.textContent = '查看返回结果 ▸';
+    toggle.onclick = () => {
+      const expanded = el.classList.toggle('expanded');
+      toggle.textContent = expanded ? '收起结果 ▾' : '查看返回结果 ▸';
+    };
+    el.append(toggle, ul);
+  }
+  activeToolStep = null;
+  logListEl.scrollTop = logListEl.scrollHeight;
+}
+
+function logToolFail(message) {
+  // 防御：没有进行中步骤时补建一个，保证失败一定有日志
+  if (!activeToolStep) {
+    logToolStart('web', '');
+  }
+  const { el, start } = activeToolStep;
+  const secs = ((performance.now() - start) / 1000).toFixed(1);
+  el.classList.remove('running');
+  el.classList.add('fail');
+  el.querySelector('.log-node').classList.remove('spin');
+  el.querySelector('.log-meta').textContent = `失败 · ${secs}s`;
+  const detail = document.createElement('div');
+  detail.className = 'log-detail error';
+  detail.textContent = message || '检索失败';
+  el.appendChild(detail);
+  activeToolStep = null;
+  logListEl.scrollTop = logListEl.scrollHeight;
+}
+
+function logAnswerStart(basis) {
+  const step = appendStep('info');
+  step.innerHTML =
+    '<span class="log-node"></span>' +
+    '<div class="log-head"><span class="log-kind answer">回答</span>' +
+    '<span class="log-action">开始生成回答</span>' +
+    `<span class="log-time">${nowTime()}</span></div>` +
+    `<div class="log-detail">${escapeHtml(basis)}</div>`;
+  answerStep = { el: step, start: performance.now() };
+}
+
+function logAnswerDone() {
+  if (answerStep) {
+    const { el, start } = answerStep;
+    const secs = ((performance.now() - start) / 1000).toFixed(1);
+    el.classList.add('ok');
+    el.querySelector('.log-action').textContent = '回答完成';
+    el.querySelector('.log-detail').textContent += ` · 生成耗时 ${secs}s`;
+    answerStep = null;
+  }
+  if (qaStart) {
+    const total = ((performance.now() - qaStart) / 1000).toFixed(1);
+    const summary = llmCalls ? `模型调用 ${llmCalls} 次（决策 ${decisionCalls} + 生成 1）` : '';
+    const step = appendStep('info');
+    step.innerHTML = `<span class="log-node"></span><div class="log-meta">本轮总耗时 ${total}s${summary ? ' · ' + summary : ''}</div>`;
+  }
+  logListEl.scrollTop = logListEl.scrollHeight;
+}
+
+function logError(message) {
+  if (llmStep) {
+    llmStep.el.querySelector('.log-node').classList.remove('spin');
+    llmStep.el.querySelector('.log-action').textContent = `第 ${llmCalls} 次调用 · 中断`;
+    llmStep = null;
+  }
+  if (activeToolStep) logToolFail(message);
+  const step = appendStep('fail');
+  step.innerHTML =
+    '<span class="log-node"></span>' +
+    '<div class="log-head"><span class="log-kind answer">错误</span>' +
+    `<span class="log-time">${nowTime()}</span></div>` +
+    `<div class="log-detail error">${escapeHtml(message)}</div>`;
+}
+
 // 助手消息骨架：头像 + 空正文（内含思考中占位），资料面板和回答后续填充
 function buildBotMessage() {
   const div = document.createElement('div');
@@ -152,6 +380,8 @@ function renderSourcesBlock(sources) {
     // 编号与 prompt 中【资料N】一致（从 1 开始），供角标定位
     card.dataset.cite = String(idx + 1);
 
+    const isWeb = s.collection === 'web';
+
     // 卡片头部：来源名 + 类型标签 + 相似度
     const head = document.createElement('div');
     head.className = 'source-card-head';
@@ -160,8 +390,8 @@ function renderSourcesBlock(sources) {
     nameWrap.className = 'source-name-wrap';
 
     const tag = document.createElement('span');
-    tag.className = `source-tag ${s.collection === 'faq' ? 'tag-faq' : 'tag-doc'}`;
-    tag.textContent = s.collection === 'faq' ? 'FAQ' : '文档';
+    tag.className = `source-tag ${isWeb ? 'tag-web' : s.collection === 'faq' ? 'tag-faq' : 'tag-doc'}`;
+    tag.textContent = isWeb ? '网页' : s.collection === 'faq' ? 'FAQ' : '文档';
     nameWrap.appendChild(tag);
 
     // URL 来源渲染为可点击链接，文件来源为普通文本
@@ -176,33 +406,44 @@ function renderSourcesBlock(sources) {
       name = document.createElement('span');
       name.className = 'source-name';
     }
-    name.textContent = s.source || '(未知来源)';
+    // 网页卡片展示标题（更可读），KB 卡片展示来源路径
+    name.textContent = isWeb ? (s.title || s.source) : (s.source || '(未知来源)');
     name.title = s.source;
     nameWrap.appendChild(name);
 
-    const score = document.createElement('span');
-    score.className = 'source-score';
-    const pct = Math.round((s.score || 0) * 100);
-    score.textContent = `${pct}%`;
-    score.title = `相似度 ${pct}%`;
-    if (pct >= 80) score.classList.add('score-high');
-    else if (pct >= 60) score.classList.add('score-mid');
-    else score.classList.add('score-low');
-
-    head.append(nameWrap, score);
+    head.append(nameWrap);
     card.appendChild(head);
 
-    // 相似度进度条
-    const bar = document.createElement('div');
-    bar.className = 'score-bar';
-    const fill = document.createElement('div');
-    fill.className = 'score-bar-fill';
-    fill.style.width = `${pct}%`;
-    if (pct >= 80) fill.classList.add('score-high');
-    else if (pct >= 60) fill.classList.add('score-mid');
-    else fill.classList.add('score-low');
-    bar.appendChild(fill);
-    card.appendChild(bar);
+    if (isWeb) {
+      // 网页卡片：Tavily 相关度与向量相似度不同义，不展示百分比，改显域名
+      const host = document.createElement('div');
+      host.className = 'source-host';
+      try { host.textContent = new URL(s.source).hostname; } catch (e) { host.textContent = ''; }
+      card.appendChild(host);
+    } else {
+      const score = document.createElement('span');
+      score.className = 'source-score';
+      const pct = Math.round((s.score || 0) * 100);
+      score.textContent = `${pct}%`;
+      score.title = `相似度 ${pct}%`;
+      if (pct >= 80) score.classList.add('score-high');
+      else if (pct >= 60) score.classList.add('score-mid');
+      else score.classList.add('score-low');
+
+      head.append(score);
+
+      // 相似度进度条
+      const bar = document.createElement('div');
+      bar.className = 'score-bar';
+      const fill = document.createElement('div');
+      fill.className = 'score-bar-fill';
+      fill.style.width = `${pct}%`;
+      if (pct >= 80) fill.classList.add('score-high');
+      else if (pct >= 60) fill.classList.add('score-mid');
+      else fill.classList.add('score-low');
+      bar.appendChild(fill);
+      card.appendChild(bar);
+    }
 
     // 片段正文（默认折叠前 2 行）
     const text = document.createElement('div');
@@ -284,6 +525,7 @@ async function createSession() {
   localStorage.setItem('session_id', currentSessionId);
   inputEl.value = '';
   renderChatWelcome();
+  setLogCollapsed(true);  // 新会话无日志 → 自动收起面板
   await loadSessions();
 }
 
@@ -319,6 +561,8 @@ async function loadSessionMessages(id) {
   const res = await fetch(`/api/sessions/${id}/messages`);
   const data = await res.json();
   messagesEl.innerHTML = '';
+  resetLog();  // 历史会话无执行日志，恢复空状态
+  setLogCollapsed(true);  // 历史会话自动收起日志面板
   const msgs = data.messages || [];
   if (!msgs.length) {
     renderChatWelcome();
@@ -330,30 +574,8 @@ async function loadSessionMessages(id) {
 
 function renderChatWelcome() {
   messagesEl.innerHTML = '';
+  resetLog();
   addMessage('bot', '你好！知识文件已在服务启动时自动入库，直接基于你的资料提问即可。');
-}
-
-// ---------- 知识库列表 ----------
-async function loadDocs() {
-  const res = await fetch('/api/documents');
-  const data = await res.json();
-  docCountEl.textContent = data.documents.length;
-  docListEl.innerHTML = '';
-  data.documents.forEach(doc => {
-    const li = document.createElement('li');
-
-    const name = document.createElement('span');
-    name.className = 'doc-name';
-    name.textContent = doc.source;
-    name.title = `${doc.source} · ${doc.chunk_count} 个片段 · 入库于 ${doc.indexed_at}`;
-
-    const meta = document.createElement('span');
-    meta.className = 'doc-meta';
-    meta.textContent = `${doc.chunk_count} 段`;
-
-    li.append(name, meta);
-    docListEl.appendChild(li);
-  });
 }
 
 // ---------- 问答（SSE 流式） ----------
@@ -364,12 +586,15 @@ async function sendQuestion() {
   sendBtn.disabled = true;
 
   addMessage('user', question);
+  logQuestion(question);  // 右侧日志：新一轮问答，先记提问并清空上一轮日志
   // 立即创建助手消息骨架（含"思考中"占位），检索期间页面不再空白
   const built = buildBotMessage();
   let { body, answerEl, thinking } = built;
   let fullText = '';   // 流式累积的回答原文
   let gotToken = false;
-  let sourcesCount = 0; // 本轮实际检索到的资料数（判定角标是否越界）
+  let sourcesCount = 0;    // 本轮实际资料数（KB + 联网），判定 [资料N] 角标是否越界
+  let currentSources = []; // 本轮累计资料（KB + 联网），网页资料编号接续其后
+  let sourcesBlock = null; // 当前资料面板 DOM（sources/web_sources 到达时整体重渲染）
 
   const removeThinking = () => { if (thinking) { thinking.remove(); thinking = null; } };
 
@@ -377,7 +602,11 @@ async function sendQuestion() {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, session_id: currentSessionId }),
+      body: JSON.stringify({
+        question,
+        session_id: currentSessionId,
+        web_search_enabled: webSearchCheck.checked,
+      }),
     });
 
     const reader = res.body.getReader();
@@ -396,23 +625,74 @@ async function sendQuestion() {
         if (!line) continue;
         const evt = JSON.parse(line.slice(6));
 
-        if (evt.type === 'sources') {
-          // 检索完成：资料面板插到回答上方，占位继续显示到首个 token
-          sourcesCount = (evt.documents || []).length;
-          showSources(body, evt.documents, answerEl);
+        if (evt.type === 'llm_start') {
+          // 右侧日志：模型第 N 次调用开始（是决策还是生成，由后续事件定型）
+          logLlmStart(evt.call);
+        } else if (evt.type === 'kb_searching') {
+          // 该次模型调用以调用工具告终 → 定型为决策；右侧日志：本地知识库检索开始
+          logLlmDecision();
+          logToolStart('kb', evt.query);
+        } else if (evt.type === 'sources') {
+          // 右侧日志：本地检索完成（结果数 + 耗时，可展开看每条标题）
+          logToolFinish(evt.documents, 'kb');
+          // KB 资料到达：追加进累计列表并整体重渲染资料面板（编号接续）
+          currentSources = currentSources.concat(evt.documents || []);
+          sourcesCount = currentSources.length;
+          if (sourcesBlock) sourcesBlock.remove();
+          sourcesBlock = showSources(body, currentSources, answerEl);
+        } else if (evt.type === 'searching') {
+          // 该次模型调用以调用工具告终 → 定型为决策；右侧日志：联网搜索开始
+          logLlmDecision();
+          logToolStart('web', evt.query);
+        } else if (evt.type === 'web_sources') {
+          // 右侧日志：联网搜索完成
+          logToolFinish(evt.documents, 'web');
+          // 联网资料到达：追加进累计列表并整体重渲染资料面板（编号接续 KB 之后）
+          currentSources = currentSources.concat(evt.documents || []);
+          sourcesCount = currentSources.length;
+          if (sourcesBlock) sourcesBlock.remove();
+          sourcesBlock = showSources(body, currentSources, answerEl);
+        } else if (evt.type === 'search_failed') {
+          // 右侧日志：检索失败/无结果（红色标记，模型会自行声明降级）
+          logToolFail(evt.message);
         } else if (evt.type === 'token') {
-          if (!gotToken) { removeThinking(); gotToken = true; }
+          if (!gotToken) {
+            removeThinking();
+            const basis = currentSources.length
+              ? `基于 ${currentSources.length} 条检索资料作答`
+              : '未检索资料，基于模型自身知识作答';
+            if (llmStep) {
+              // 进行中的"模型调用"步骤就地定型为生成回答（本次调用 = 生成）
+              const { el } = llmStep;
+              el.classList.remove('running');
+              el.classList.add('info');
+              el.querySelector('.log-node').classList.remove('spin');
+              el.innerHTML =
+                '<span class="log-node"></span>' +
+                '<div class="log-head"><span class="log-kind answer">回答</span>' +
+                '<span class="log-action">开始生成回答</span>' +
+                `<span class="log-time">${nowTime()}</span></div>` +
+                `<div class="log-detail">${escapeHtml(basis)}</div>`;
+              answerStep = { el, start: performance.now() };
+              llmStep = null;
+            } else {
+              logAnswerStart(basis);
+            }
+            gotToken = true;
+          }
           fullText += evt.content;
           // 每个 token 后重渲染 Markdown + 引用角标（文本量小，性能无压力）
           answerEl.innerHTML = renderAnswerHTML(fullText, sourcesCount, true);
         } else if (evt.type === 'error') {
           removeThinking();
+          logError(evt.message);
           const errEl = document.createElement('div');
           errEl.className = 'chat-error';
           errEl.textContent = '[错误] ' + evt.message;
           answerEl.appendChild(errEl);
         } else if (evt.type === 'done') {
           removeThinking();
+          logAnswerDone();
           // 最终完整渲染一次，保证闭合状态正确
           if (fullText) answerEl.innerHTML = renderAnswerHTML(fullText, sourcesCount, true);
           // 回答结束，刷新会话列表（标题可能从"新会话"变为首条问题）
@@ -423,6 +703,7 @@ async function sendQuestion() {
     }
   } catch (e) {
     removeThinking();
+    logError('请求失败：' + e.message);
     const errEl = document.createElement('div');
     errEl.className = 'chat-error';
     errEl.textContent = '请求失败：' + e.message;
@@ -452,7 +733,7 @@ async function init() {
     localStorage.setItem('session_id', currentSessionId);
   }
   renderChatWelcome();
-  await Promise.all([loadSessions(), loadDocs()]);
+  await loadSessions();
 }
 
 init();

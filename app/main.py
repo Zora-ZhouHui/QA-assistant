@@ -48,11 +48,14 @@ async def lifespan(app: FastAPI):
     settings.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     # 启动顺序：
-    #   1) 爬取 D2L 文档站 → 落盘 md 到 data/d2l/
+    #   1) 爬取 D2L 文档站 → 落盘 md 到 data/d2l/（仅本地存在数据管线时执行）
     #   2) 扫描 data/ 同步文档知识库（含刚爬取的 D2L md）
     #   3) 抓取 FAQ 题库同步到 faq collection
     # 都是 CPU/IO 密集的同步流程，放线程池避免阻塞事件循环。
-    await run_in_threadpool(crawl_all_pages)
+    # crawl_all_pages 来自被 gitignore 的数据管线；目录缺失时为 None，
+    # 必须跳过——直接传 None 给 run_in_threadpool 会抛 TypeError 阻断启动。
+    if crawl_all_pages is not None:
+        await run_in_threadpool(crawl_all_pages)
     await run_in_threadpool(sync_index)
     await run_in_threadpool(sync_faq)
     yield
