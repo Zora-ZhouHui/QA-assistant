@@ -37,7 +37,8 @@ class Settings(BaseSettings):
     search_depth: str = "advanced"      # basic=1 credit/次；advanced=2 credits，正文更全，可减少二次搜索
     search_country: str = "china"       # 地域限定（Tavily country 参数），留空则不限
     search_timeout: float = 15.0        # 搜索请求超时（秒）
-    search_max_rounds: int = 2          # 单次问答最多几轮工具调用（防失控、控延迟）
+    search_max_rounds: int = 3          # 单次问答最多几轮工具调用（最后安全网，硬上限）
+    max_consecutive_empty: int = 2      # 连续几次检索为空/失败即熔断，提前收回工具
     web_search_default: bool = True     # 前端联网开关的默认值
 
     # 会话记忆压缩阈值（token 粗估，见 app/services/memory.py）

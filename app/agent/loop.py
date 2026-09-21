@@ -5,8 +5,17 @@
   2. 流式请求 LLM（携带可用工具 schema）
        - token 事件 → 直接透传给前端
        - tool_calls → 执行工具 → 结果接续编号回灌 → 进入下一轮请求
-  3. 工具执行轮数达到 search_max_rounds 后不再提供工具，
-     强制模型基于已有信息收尾作答（防失控、控延迟）。
+  3. 防失控的三道刹车（分层，均为"软收尾"——答案始终由模型自己生成）：
+       a. 重复调用拦截：同工具 + 同归一化 query 且上次拿到了非空结果时，
+          再次调用不真正执行（向量检索对同词是确定性的，重跑只返回同一批资料），
+          直接回灌拦截提示并引导模型换关键词改写；注意失败调用不入账，
+          允许对瞬时故障用原词重试；
+       b. 空结果熔断：连续 max_consecutive_empty 次检索为空/失败，
+          提前收回工具（单次失败给重试机会，连续失败才止损），
+          让模型基于已有信息坦诚收尾；
+       c. 轮数硬上限：达到 search_max_rounds 后收回全部工具 schema，
+          模型在协议层无法再发起 tool_call（不是提示词软约束），必然下一轮收尾。
+     另在最后一次有工具的轮次结果后追加"最后机会"预告，让模型带着收尾意识检索。
 
 分层约束：本模块只认识 LLM 抽象（core/llm）与工具注册表（tools/），
 不依赖具体模型厂商与搜索引擎——换厂商改 .env，换引擎改 services/search。
@@ -63,6 +72,11 @@ class AgentService:
         next_index = 1  # 全局编号计数器：KB 与网页资料共用一套编号，按到达顺序接续
         executed_rounds = 0
         llm_calls = 0   # 模型调用总次数（决策 + 生成）
+        # 刹车 a：已执行过的 (工具名, 归一化 query)，重复出现直接拦截
+        seen_calls: set = set()
+        # 刹车 b：连续空结果/失败计数，命中即熔断；任一次拿到结果立即归零
+        consecutive_empty = 0
+        tools_revoked = False  # 熔断标记：一旦置位，后续轮次不再提供任何工具
 
         logger.info(
             "开始处理 | 问题=%r | 联网=%s",
@@ -70,8 +84,12 @@ class AgentService:
         )
 
         while True:
-            # 轮数用尽后收回所有工具，逼模型基于已有信息收尾
-            if executed_rounds < settings.search_max_rounds:
+            # 轮数用尽（硬上限）或已被空结果熔断时，收回所有工具，
+            # 模型在协议层无法发起 tool_call，只能基于已有信息收尾
+            if (
+                executed_rounds < settings.search_max_rounds
+                and not tools_revoked
+            ):
                 tools = get_tools(web_search_enabled)
             else:
                 tools = []
@@ -130,11 +148,43 @@ class AgentService:
                 except json.JSONDecodeError:
                     query = ""
 
-                # 先发"检索中"事件，前端立即展示检索状态
+                # 先发"检索中"事件：前端立即展示检索状态，同时把本次模型
+                # 调用定型为"决策"。重复拦截也照发这套事件，保证日志节点闭合
                 if name == "kb_search":
                     yield {"type": "kb_searching", "query": query, "round": executed_rounds}
                 elif name == "web_search":
                     yield {"type": "searching", "query": query, "round": executed_rounds}
+
+                # 刹车 a：同工具 + 同归一化关键词、且上次执行拿到过非空结果 →
+                # 不真正执行。向量检索对同一 query 的结果是确定性的，重跑只会
+                # 返回上方同一批资料；想补充信息必须改写关键词（不同 key 不拦）。
+                # 注意：失败的调用不在账本里（见下方成功分支才入账），
+                # 因此瞬时故障后用原词重试不会被误拦。
+                norm_query = " ".join(query.strip().lower().split())
+                dedup_key = (name, norm_query)
+                if dedup_key in seen_calls:
+                    logger.info(
+                        "第%d轮 | 重复工具调用已拦截: %s(%r)",
+                        executed_rounds, name, query[:40],
+                    )
+                    tool_content = (
+                        f"【系统拦截】你已使用完全相同的关键词成功调用过 {name}。"
+                        "检索结果对同一关键词是确定的，再次调用只会返回上方那批"
+                        "相同资料，本次未重复执行。若现有资料不足以覆盖问题的某个"
+                        "方面，请换一个角度或更换关键词重新构造检索词（禁止再使用"
+                        "本条完全相同的关键词）；若判断无法通过检索补齐，请直接"
+                        "基于已有资料作答或如实告知用户。"
+                    )
+                    yield {
+                        "type": "search_failed",
+                        "query": query,
+                        "message": "重复检索已自动拦截（同工具、同关键词），请换关键词改写",
+                        "round": executed_rounds,
+                    }
+                    messages.append(
+                        {"role": "tool", "tool_call_id": call_id, "content": tool_content}
+                    )
+                    continue
 
                 t0 = time.monotonic()
 
@@ -151,6 +201,10 @@ class AgentService:
                     fmt = _format_web_block
 
                 if results:
+                    # 拿到有效结果：空结果 streak 归零，并把该词记入去重账本
+                    # （失败不记账：瞬时故障后允许原词重试一次）
+                    consecutive_empty = 0
+                    seen_calls.add(dedup_key)
                     # 编号接续：从 next_index 起分配，KB 与网页共用一套编号
                     start = next_index
                     numbered: List[Dict[str, Any]] = []
@@ -169,13 +223,49 @@ class AgentService:
                 else:
                     # 检索失败/空结果：执行器已备好可读的降级说明
                     tool_content = result.get("output", "检索失败")
-                    # 轨迹事件：失败/空结果也要在前端轨迹中可见
+                    # 轨迹事件：先发原始降级说明（前端失败日志保持干净）
                     yield {
                         "type": "search_failed",
                         "query": query,
                         "message": tool_content,
                         "round": executed_rounds,
                     }
+                    consecutive_empty += 1
+                    # 刹车 b：连续空结果达到阈值 → 熔断，下一轮起提前收回工具
+                    if (
+                        not tools_revoked
+                        and consecutive_empty >= settings.max_consecutive_empty
+                    ):
+                        tools_revoked = True
+                        tool_content += (
+                            f"\n\n【系统提示】已连续 {consecutive_empty} 次检索无结果，"
+                            "工具已提前收回，后续无法再发起任何检索。请基于已有资料作答；"
+                            "若确无相关信息，请坦诚告知用户未查到，不要再尝试调用工具。"
+                        )
+                        logger.warning(
+                            "第%d轮 | 连续%d次检索为空，触发熔断，提前收回工具",
+                            executed_rounds, consecutive_empty,
+                        )
+
+                # 最后机会预告：让模型带着"必须收尾"的意识组织下一轮决策
+                # （熔断提示已含收尾指令，不再叠加）
+                if not tools_revoked:
+                    if (
+                        settings.search_max_rounds > 1
+                        and executed_rounds == settings.search_max_rounds - 1
+                    ):
+                        # 本轮是最后一次还能拿到工具的请求
+                        tool_content += (
+                            "\n\n【系统提示】这是最后一次调用工具的机会：下一轮将收回"
+                            "全部工具，请确认本轮检索已补齐回答所需信息，并在下一轮直接"
+                            "给出完整最终答案。"
+                        )
+                    elif executed_rounds >= settings.search_max_rounds:
+                        # 本轮工具执行完即达硬上限（search_max_rounds=1 也走这里）
+                        tool_content += (
+                            "\n\n【系统提示】工具调用轮数已达上限，下一轮不会再提供"
+                            "任何工具，请立即基于以上全部资料给出完整最终答案。"
+                        )
 
                 logger.info(
                     "工具 %s 完成 | 耗时=%.2fs | 命中=%d条",
