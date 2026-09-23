@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from app.config import settings
 from app.core.llm import get_llm_client
@@ -98,6 +98,30 @@ class MemoryService:
         archive = d / "archive.jsonl"
         source = archive if archive.exists() else d / "messages.jsonl"
         return self._read_jsonl(source)
+
+    def append_trace(self, session_id: str, event: Dict[str, Any]) -> None:
+        """追加一条执行轨迹事件（llm_start/searching/sources/...），落盘供历史回放。
+
+        与对话内容（archive/messages）分离：这里只存"决策与检索"轨迹，
+        不含 token（回答原文已由 archive 持久化）。只追加，压缩不影响它。
+        """
+        self._validate(session_id)
+        d = self._dir(session_id)
+        with (d / "trace.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+    def load_trace(self, session_id: str) -> List[Dict[str, Any]]:
+        """读取执行轨迹事件（正序），供前端历史会话回放。文件不存在视为空。"""
+        self._validate(session_id)
+        path = self._dir(session_id) / "trace.jsonl"
+        if not path.exists():
+            return []
+        events: List[Dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+        return events
 
     def append(self, session_id: str, role: str, content: str) -> None:
         """追加一条消息：archive.jsonl 全量归档 + messages.jsonl 工作窗口（均 O(1)）。"""

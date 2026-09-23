@@ -58,8 +58,20 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             yield _sse({"type": "error", "message": f"会话标识非法: {e}"})
             return
 
+        # 先落一条"新一轮提问"边界事件：回放时据此把同一 session 内多个问题
+        # 的轨迹切分开，否则两个问题的 llm_start 会连成一片、前面的展示不出来。
+        mem_service.append_trace(
+            req.session_id, {"type": "question", "question": req.question}
+        )
+
         # Agent 工具循环：模型自决检索本地库（kb_search）/ 联网（web_search）/ 直答；
         # KB 检索不再固定前置，无关问题直接作答省掉向量检索等待。收集完整回答用于落库。
+        # 轨迹落库辅助：观测类事件（决策/检索轨迹）在透传前端的同时写入 trace.jsonl，
+        # 供刷新 / 切换会话后回放；token 是业务内容，回答原文已由 archive 持久化。
+        def emit(payload: dict) -> str:
+            mem_service.append_trace(req.session_id, payload)
+            return _sse(payload)
+
         full_answer: list = []
         try:
             async for event in agent.run_stream(
@@ -69,17 +81,17 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                     full_answer.append(event["content"])
                     yield _sse({"type": "token", "content": event["content"]})
                 elif event["type"] == "llm_start":
-                    yield _sse({"type": "llm_start", "call": event["call"]})
+                    yield emit({"type": "llm_start", "call": event["call"]})
                 elif event["type"] == "kb_searching":
-                    yield _sse({"type": "kb_searching", "query": event["query"]})
+                    yield emit({"type": "kb_searching", "query": event["query"]})
                 elif event["type"] == "searching":
-                    yield _sse({"type": "searching", "query": event["query"]})
+                    yield emit({"type": "searching", "query": event["query"]})
                 elif event["type"] == "sources":
-                    yield _sse({"type": "sources", "documents": event["documents"]})
+                    yield emit({"type": "sources", "documents": event["documents"]})
                 elif event["type"] == "web_sources":
-                    yield _sse({"type": "web_sources", "documents": event["documents"]})
+                    yield emit({"type": "web_sources", "documents": event["documents"]})
                 elif event["type"] == "search_failed":
-                    yield _sse(
+                    yield emit(
                         {
                             "type": "search_failed",
                             "query": event["query"],

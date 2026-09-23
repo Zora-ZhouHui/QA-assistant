@@ -561,7 +561,7 @@ async function loadSessionMessages(id) {
   const res = await fetch(`/api/sessions/${id}/messages`);
   const data = await res.json();
   messagesEl.innerHTML = '';
-  resetLog();  // 历史会话无执行日志，恢复空状态
+  resetLog();  // 先恢复空状态，若该会话有轨迹则随后回放
   setLogCollapsed(true);  // 历史会话自动收起日志面板
   const msgs = data.messages || [];
   if (!msgs.length) {
@@ -570,6 +570,128 @@ async function loadSessionMessages(id) {
   }
   // 后端返回正序（旧→新），直接逐条 append 即可
   msgs.forEach(m => addMessage(m.role, m.content));
+  // 回放该会话的历史执行轨迹（有则渲染，替代空状态；面板仍保持收起，展开即可见）
+  await loadTraceForSession(id);
+}
+
+// 拉取并回放历史会话的执行轨迹；失败保持空状态，不影响历史消息展示。
+async function loadTraceForSession(id) {
+  try {
+    const res = await fetch(`/api/sessions/${id}/trace`);
+    const data = await res.json();
+    if (data.events && data.events.length) renderTrace(data.events);
+  } catch (e) {
+    // 忽略：轨迹回放失败不阻断历史消息
+  }
+}
+
+// 静态回放一段执行轨迹（区别于 sendQuestion 内的实时流式渲染，
+// 这里直接渲染最终态：决策/生成、检索词、命中数、结果列表、失败信息，不做耗时计时）。
+function renderTrace(events) {
+  const empty = logListEl.querySelector('.log-empty');
+  if (empty) empty.remove();
+
+  let modelEl = null, modelCall = 0, toolEl = null;
+
+  const relabelModel = (text) => {
+    if (!modelEl) return;
+    modelEl.classList.remove('running');
+    modelEl.classList.add('info');
+    modelEl.querySelector('.log-node').classList.remove('spin');
+    modelEl.querySelector('.log-action').textContent = text;
+    modelEl = null;
+  };
+
+  events.forEach(evt => {
+    if (evt.type === 'question') {
+      // 新一轮提问边界：先收尾上一个问题悬空的模型步骤，再开"提问"节点
+      if (modelEl) relabelModel(`第 ${modelCall} 次调用 · 生成回答`);
+      toolEl = null;
+      const step = appendStep('info');
+      step.innerHTML =
+        '<span class="log-node"></span>' +
+        '<div class="log-head"><span class="log-kind question">提问</span>' +
+        '<span class="log-action">用户问题</span></div>' +
+        `<div class="log-detail">${escapeHtml(evt.question || '')}</div>`;
+    } else if (evt.type === 'llm_start') {
+      if (modelEl) relabelModel(`第 ${modelCall} 次调用 · 生成回答`);
+      modelCall = evt.call;
+      modelEl = appendStep('running');
+      modelEl.innerHTML =
+        '<span class="log-node spin"></span>' +
+        '<div class="log-head"><span class="log-kind model">模型</span>' +
+        `<span class="log-action">第 ${modelCall} 次调用 · 推理中</span></div>`;
+    } else if (evt.type === 'kb_searching' || evt.type === 'searching') {
+      if (modelEl) relabelModel(`第 ${modelCall} 次调用 · 决策：调用工具`);
+      const kind = evt.type === 'kb_searching' ? 'kb' : 'web';
+      const label = kind === 'kb' ? '本地检索' : '联网搜索';
+      toolEl = appendStep('running');
+      toolEl.innerHTML =
+        '<span class="log-node spin"></span>' +
+        '<div class="log-head">' +
+        `<span class="log-kind ${kind}">${label}</span></div>` +
+        `<div class="log-query">检索词 <code>${escapeHtml(evt.query || '')}</code></div>` +
+        '<div class="log-meta">执行中…</div>';
+    } else if (evt.type === 'sources' || evt.type === 'web_sources') {
+      fillToolDone(toolEl, evt.type === 'web_sources' ? 'web' : 'kb', evt.documents || []);
+      toolEl = null;
+    } else if (evt.type === 'search_failed') {
+      fillToolFailed(toolEl, evt.message || '检索失败');
+      toolEl = null;
+    }
+  });
+
+  if (modelEl) relabelModel(`第 ${modelCall} 次调用 · 生成回答`);
+}
+
+function fillToolDone(step, kind, docs) {
+  if (!step) return;
+  step.classList.remove('running');
+  step.classList.add('ok');
+  step.querySelector('.log-node').classList.remove('spin');
+  step.querySelector('.log-meta').textContent = `返回 ${docs.length} 条`;
+  if (docs.length) {
+    const ul = document.createElement('ul');
+    ul.className = 'log-results';
+    docs.forEach(d => {
+      const li = document.createElement('li');
+      const idx = `<span class="log-result-idx">[资料${d.index}]</span>`;
+      if (kind === 'web' && d.source) {
+        li.innerHTML = idx;
+        const a = document.createElement('a');
+        a.href = d.source; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = _resultTitle(d, kind);
+        li.appendChild(a);
+        const src = document.createElement('span');
+        src.className = 'log-result-src';
+        src.textContent = _domain(d.source);
+        li.appendChild(src);
+      } else {
+        li.innerHTML = idx + escapeHtml(_resultTitle(d, kind));
+      }
+      ul.appendChild(li);
+    });
+    const toggle = document.createElement('button');
+    toggle.className = 'log-results-toggle';
+    toggle.textContent = '查看返回结果 ▸';
+    toggle.onclick = () => {
+      const expanded = step.classList.toggle('expanded');
+      toggle.textContent = expanded ? '收起结果 ▾' : '查看返回结果 ▸';
+    };
+    step.append(toggle, ul);
+  }
+}
+
+function fillToolFailed(step, message) {
+  if (!step) return;
+  step.classList.remove('running');
+  step.classList.add('fail');
+  step.querySelector('.log-node').classList.remove('spin');
+  step.querySelector('.log-meta').textContent = '失败';
+  const detail = document.createElement('div');
+  detail.className = 'log-detail error';
+  detail.textContent = message;
+  step.appendChild(detail);
 }
 
 function renderChatWelcome() {

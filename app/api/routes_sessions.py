@@ -52,3 +52,17 @@ def get_session_messages(session_id: str) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"messages": messages}
+
+
+@router.get("/{session_id}/trace")
+def get_session_trace(session_id: str) -> dict:
+    """读取指定会话的执行轨迹（决策/检索过程），供历史会话回放。
+
+    与 /messages 读取对话原文互补：这里返回 llm_start/searching/sources 等
+    观测事件的正序列表，前端据此还原右侧执行日志面板。
+    """
+    try:
+        events = get_memory_service().load_trace(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"events": events}

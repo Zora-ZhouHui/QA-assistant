@@ -239,32 +239,30 @@ class AgentService:
                         tools_revoked = True
                         tool_content += (
                             f"\n\n【系统提示】已连续 {consecutive_empty} 次检索无结果，"
-                            "工具已提前收回，后续无法再发起任何检索。请基于已有资料作答；"
-                            "若确无相关信息，请坦诚告知用户未查到，不要再尝试调用工具。"
+                            "工具已提前收回，后续不再提供任何检索工具。"
+                            "请基于已有资料作答；若确无相关信息，请如实告知用户。"
                         )
                         logger.warning(
                             "第%d轮 | 连续%d次检索为空，触发熔断，提前收回工具",
                             executed_rounds, consecutive_empty,
                         )
 
-                # 最后机会预告：让模型带着"必须收尾"的意识组织下一轮决策
-                # （熔断提示已含收尾指令，不再叠加）
+                # ---- 收尾预告：根据剩余轮数给模型下一步方向 ----
+                # 熔断提示已含收尾指令，不再叠加
                 if not tools_revoked:
-                    if (
-                        settings.search_max_rounds > 1
-                        and executed_rounds == settings.search_max_rounds - 1
-                    ):
-                        # 本轮是最后一次还能拿到工具的请求
+                    remaining = settings.search_max_rounds - executed_rounds
+                    if remaining == 1:
+                        # 下一轮是最后一次有工具的请求
                         tool_content += (
-                            "\n\n【系统提示】这是最后一次调用工具的机会：下一轮将收回"
-                            "全部工具，请确认本轮检索已补齐回答所需信息，并在下一轮直接"
-                            "给出完整最终答案。"
+                            "\n\n【系统提示】你还剩最后一轮工具调用机会。"
+                            "若现有资料已足够回答，请直接作答；"
+                            "仍需补充请精简关键词检索，之后工具将收回。"
                         )
-                    elif executed_rounds >= settings.search_max_rounds:
+                    elif remaining <= 0:
                         # 本轮工具执行完即达硬上限（search_max_rounds=1 也走这里）
                         tool_content += (
-                            "\n\n【系统提示】工具调用轮数已达上限，下一轮不会再提供"
-                            "任何工具，请立即基于以上全部资料给出完整最终答案。"
+                            "\n\n【系统提示】工具调用轮数已达上限，下一轮不再提供"
+                            "任何工具，请基于以上全部资料给出完整最终答案。"
                         )
 
                 logger.info(
