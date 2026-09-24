@@ -1,7 +1,7 @@
 """Agent 评测模块（离线工具，与 runtime 服务解耦）。
 
 从业界通用的「分层评估」出发，按成本从低到高拆成三层：
-  检索层 —— Recall@K / Hit@K / MRR，零 LLM 成本（run_retrieval）；
+  检索层 —— Recall@K / nDCG@K / 单选选对率，零 LLM 成本（run_retrieval_v2）；
   生成层 —— Faithfulness / Answer Relevancy，LLM-as-a-Judge（run_generation）；
   引用层 —— Citation Precision / Recall，LLM 判定（run_citation）。
 

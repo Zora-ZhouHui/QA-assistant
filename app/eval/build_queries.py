@@ -9,7 +9,7 @@
 需要先配好 LLM_API_KEY（走环境变量或 .env）。
 
 产出 JSON 数组，每条 {faq_id, source, question, paraphrase}，
-被 run_retrieval 读取做真实指标，生成后即与运行时解耦（重跑评测无需再调 LLM）。
+供生成层 / 引用层复用为改写 query，生成后即与运行时解耦（重跑评测无需再调 LLM）。
 """
 import argparse
 import asyncio

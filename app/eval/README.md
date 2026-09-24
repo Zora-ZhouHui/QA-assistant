@@ -92,8 +92,7 @@ app/eval/
 ├── judge.py               # LLM-as-a-Judge：call_llm / parse_json + 三个裁判函数
 ├── build_retrieval_set.py # 检索评测集：四级难度 + 向量近邻负例（缓存 eval_retrieval_set.json）
 ├── run_retrieval_v2.py    # 检索层主评测：难度分级 + 下界基线 + 判别力小结
-├── build_queries.py       # 旧改写 query（缓存 eval_queries.json，供生成/引用层复用）
-├── run_retrieval.py       # 旧检索脚本：sanity check + docs 干扰归因（独立诊断）
+├── build_queries.py       # 改写 query（缓存 eval_queries.json，供生成/引用层复用）
 ├── run_generation.py      # 生成层：Faithfulness / Answer Relevancy
 └── run_citation.py        # 引用层：Citation Precision / Recall
 ```
@@ -112,7 +111,7 @@ python -m app.eval.run_retrieval_v2 --top-k 4
 
 评测集生成一次后即与运行时解耦——重跑评测不再调 LLM。缓存文件落在 `data/eval_retrieval_set.json`，属可再生派生数据，随 `data/` 一起被 `.gitignore` 排除。
 
-检索层主对象是 `query_faq`（纯 FAQ 检索，gold 只存在于 FAQ 表）。旧脚本 `run_retrieval.py` 保留为独立诊断：sanity check（验入库）+ `diff_query_paths`（docs 干扰归因），不参与 v2 评分。
+检索层主对象是 `query_faq`（纯 FAQ 检索，gold 只存在于 FAQ 表）。
 
 ***
 

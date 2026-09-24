@@ -1,14 +1,13 @@
 """检索层评测 v2：判别力优先，四级难度 + 随机下界基线。
 
-与旧版（run_retrieval.py）的核心区别：
+设计要点：
   1) 评测对象不是「题目原文 self-retrieve」（虚高≈100%），而是 build_retrieval_set
      生成的四级难度问法：L1 同义改写 / L2 口语化 / L3 难负例 / L4 激进改写（+ 向量近邻干扰项）。
   2) 指标不止「id 命中」：nDCG@K 对排序敏感，Recall@1 是第 1 名命中率，
      L3 / L4 再用「单选题选对率」让 gold 与近邻干扰项强制正面对决；
      并用「随机检索」作为下界基线，看真实系统相对随机到底有多少判别力。
 
-主对象是 query_faq（纯 FAQ 检索，隔离 docs 干扰）；query_all 的文档挤位归因仍由
-run_retrieval.py 的 diff_query_paths 承担，这里不重复。
+主对象是 query_faq（纯 FAQ 检索，隔离 docs 干扰）。
 
 用法：
     python -m app.eval.build_retrieval_set --n 50 --seed 42   # 一次性生成评测集

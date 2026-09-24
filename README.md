@@ -187,7 +187,6 @@ QA-assistant/
 │   │   ├── judge.py             #   LLM-as-a-Judge 裁判（生成层 / 引用层）
 │   │   ├── build_retrieval_set.py # 检索评测集：四级难度 + 向量近邻负例
 │   │   ├── run_retrieval_v2.py  #   检索评测：难度分级 + 下界基线 + 判别力小结
-│   │   ├── run_retrieval.py     #   旧检索脚本：sanity check + 文档干扰归因
 │   │   ├── run_generation.py    #   生成层评测（Faithfulness / Answer Relevancy）
 │   │   └── run_citation.py      #   引用层评测（Citation Precision / Recall）
 │   ├── api/                     # 路由：chat(SSE) / sessions / documents
