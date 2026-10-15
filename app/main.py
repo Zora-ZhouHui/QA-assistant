@@ -21,8 +21,11 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api import routes_chat, routes_docs, routes_sessions
 from app.config import settings
+from app.core.embeddings import embedding_model_changed, stamp_embedding_model
+from app.core.vectorstore import get_vector_store
 from app.services.faq_indexer import sync_faq
 from app.services.indexer import sync_index
+from app.services.retrieval import build_sparse_index
 
 # D2L 爬虫属于数据采集管线（app/services/data_pipeline/，已在 .gitignore 中
 # 忽略，不随功能代码发布）。采用可选导入：该目录缺失时应用照常启动，
@@ -39,6 +42,8 @@ logging.basicConfig(
 # httpx 每次请求都会打 INFO，模型加载时刷屏，压到 WARNING
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+logger = logging.getLogger("app.main")
+
 WEB_STATIC_DIR = Path(__file__).parent / "web" / "static"
 
 
@@ -48,16 +53,26 @@ async def lifespan(app: FastAPI):
     settings.sessions_dir.mkdir(parents=True, exist_ok=True)
 
     # 启动顺序：
+    #   0) 换过 embedding 模型 → 旧向量维度/语义空间已变，先整库清空，强制全量重建
     #   1) 爬取 D2L 文档站 → 落盘 md 到 data/d2l/（仅本地存在数据管线时执行）
     #   2) 扫描 data/ 同步文档知识库（含刚爬取的 D2L md）
     #   3) 抓取 FAQ 题库同步到 faq collection
+    #   4) 预热 BM25 稀疏索引（混合检索用；依赖缺失/失败自动降级为纯稠密）
+    #   5) 记录当前 embedding 模型名，供下次启动做变更检测
     # 都是 CPU/IO 密集的同步流程，放线程池避免阻塞事件循环。
     # crawl_all_pages 来自被 gitignore 的数据管线；目录缺失时为 None，
     # 必须跳过——直接传 None 给 run_in_threadpool 会抛 TypeError 阻断启动。
+    if embedding_model_changed():
+        logger.info(
+            "检测到 embedding 模型已更换为 %s，向量库将整库清空重建", settings.embedding_model
+        )
+        await run_in_threadpool(lambda: get_vector_store().reset())
     if crawl_all_pages is not None:
         await run_in_threadpool(crawl_all_pages)
     await run_in_threadpool(sync_index)
     await run_in_threadpool(sync_faq)
+    await run_in_threadpool(build_sparse_index)
+    await run_in_threadpool(stamp_embedding_model)
     yield
 
 

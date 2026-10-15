@@ -19,6 +19,7 @@ from app.core.embeddings import get_embedder
 from app.core.vectorstore import get_vector_store
 from app.services.document_loader import load_text
 from app.services.embedding_snapshot import get_snapshot
+from app.services.retrieval import get_retriever
 from app.services.splitter import split_text
 
 
@@ -72,12 +73,11 @@ class RAGService:
 
     # ---------- 检索 ----------
     async def search(self, question: str, top_k: int) -> List[Dict[str, Any]]:
-        # embedding 计算是 CPU 密集的同步操作，放到线程池避免阻塞事件循环
-        embedder = get_embedder()
-        query_vector = await run_in_threadpool(embedder.embed_query, question)
-        store = get_vector_store()
-        # 综合搜索 docs + faq，按 cosine 相似度全局排序后返回 top_k
-        return await run_in_threadpool(store.query_all, query_vector, top_k)
+        # 检索管线（稠密 + 稀疏融合 + 重排）是 CPU 密集的同步操作，
+        # 放到线程池避免阻塞事件循环。内部细节收口在 services/retrieval，
+        # 本服务只负责"调用 + 线程池"这一层。
+        retriever = get_retriever()
+        return await run_in_threadpool(retriever.retrieve, question, top_k)
 
 
 @lru_cache

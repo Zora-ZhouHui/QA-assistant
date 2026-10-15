@@ -24,13 +24,13 @@
 import json
 import re
 import shutil
-from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.config import settings
+from app.core.contracts import SessionMemory
 from app.core.llm import get_llm_client
 
 # session_id 白名单：只允许字母数字/_/-，长度 8-128。
@@ -44,13 +44,6 @@ COMPRESS_PROMPT = """下面是之前对话的片段。请提炼成不超过 300 
 
 对话片段：
 {transcript}"""
-
-
-@dataclass
-class SessionMemory:
-    """一个会话的内存态快照：近轮原文 + 滚动摘要。"""
-    messages: List[Dict[str, str]] = field(default_factory=list)
-    running_summary: str = ""
 
 
 class MemoryService:
@@ -123,15 +116,43 @@ class MemoryService:
                 events.append(json.loads(line))
         return events
 
-    def append(self, session_id: str, role: str, content: str) -> None:
-        """追加一条消息：archive.jsonl 全量归档 + messages.jsonl 工作窗口（均 O(1)）。"""
+    def append(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        images: Optional[List[str]] = None,
+        window_content: Optional[str] = None,
+    ) -> None:
+        """追加一条消息：archive.jsonl 全量归档 + messages.jsonl 工作窗口（均 O(1)）。
+
+        content 是给人看的历史原文（archive.jsonl）；window_content 是给 LLM 的
+        工作窗口文本（messages.jsonl），缺省时与 content 相同。截图问答两者不同：
+        归档只存用户原文（解析文本是模型产物，不该回显在用户气泡里），而工作窗口
+        需要完整的解析文本 + 追问句提供语境。
+
+        images 为可选的多模态附件（图片 base64 dataURL）：
+          - archive.jsonl（给人看的历史）保留完整 images 字段，供前端历史回放显示缩略图；
+          - messages.jsonl（给 LLM 的工作窗口）只写文字 + 占位提示，绝不装 base64，
+            避免破坏 token 估算与滚动压缩（压缩逻辑假定 content 是纯文本）。
+        """
         self._validate(session_id)
-        record = json.dumps({"role": role, "content": content}, ensure_ascii=False)
         d = self._dir(session_id)
+
+        archive_record = {"role": role, "content": content}
+        if images:
+            archive_record["images"] = images
+
+        # 工作窗口里的 user 消息：附占位让后续轮次的模型知道上文有截图
+        msg_content = window_content if window_content is not None else content
+        if images:
+            msg_content = f"{msg_content}\n〔本轮附 {len(images)} 张截图〕"
+        msg_record = {"role": role, "content": msg_content}
+
         with (d / "archive.jsonl").open("a", encoding="utf-8") as f:
-            f.write(record + "\n")
+            f.write(json.dumps(archive_record, ensure_ascii=False) + "\n")
         with (d / "messages.jsonl").open("a", encoding="utf-8") as f:
-            f.write(record + "\n")
+            f.write(json.dumps(msg_record, ensure_ascii=False) + "\n")
 
     # ---------- 压缩 ----------
     async def maybe_compress(self, session_id: str) -> None:
@@ -249,11 +270,11 @@ class MemoryService:
                 active_file = d / "messages.jsonl"
             messages = self._read_jsonl(active_file)
 
-            # 标题：取第一条用户消息前 30 字
+            # 标题：取第一条用户消息前 30 字（纯贴图提问 content 为空，用占位名）
             title = "新会话"
             for m in messages:
                 if m.get("role") == "user":
-                    title = m["content"][:30]
+                    title = m["content"][:30] or "截图提问"
                     break
 
             last_active = (

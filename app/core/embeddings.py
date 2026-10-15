@@ -5,6 +5,7 @@
 """
 import os
 from functools import lru_cache
+from pathlib import Path
 from typing import List
 
 from app.config import settings
@@ -49,3 +50,26 @@ class Embedder:
 @lru_cache
 def get_embedder() -> Embedder:
     return Embedder()
+
+
+def _model_marker_path() -> Path:
+    return settings.data_dir / "embedding_model.txt"
+
+
+def embedding_model_changed() -> bool:
+    """当前 embedding 模型是否与上次入库时记录的不同。
+
+    换模型后旧向量维度/语义空间都会变，沿用会维度不匹配或结果无意义——
+    这是"换 embedding 模型"最容易踩的坑，必须在启动建库前统一检测。
+    """
+    path = _model_marker_path()
+    if not path.exists():
+        return False
+    previous = path.read_text(encoding="utf-8").strip()
+    return bool(previous) and previous != settings.embedding_model
+
+
+def stamp_embedding_model() -> None:
+    """记录当前 embedding 模型名（入库完成后调用）。"""
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    _model_marker_path().write_text(settings.embedding_model, encoding="utf-8")

@@ -598,6 +598,17 @@ button.primary:hover {
   overflow-wrap: break-word;
 }
 
+/* 用户消息内的截图缩略图 */
+.msg-image {
+  display: block;
+  max-width: 260px;
+  max-height: 220px;
+  margin-top: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  object-fit: contain;
+}
+
 /* ---------- 检索资料面板（可折叠） ---------- */
 .sources-block {
   margin-bottom: 10px;
@@ -843,6 +854,74 @@ a.source-name:hover,
   width: 64px;
   border-radius: 10px;
   padding: 9px 0;
+}
+
+/* ---------- 图片上传按钮（输入框内） ---------- */
+.image-btn {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.image-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent-line);
+}
+
+/* ---------- 待发送图片预览条（输入框上方） ---------- */
+.image-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+
+.image-preview-item {
+  position: relative;
+  width: 56px;
+  height: 56px;
+  flex-shrink: 0;
+}
+
+.image-preview-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+
+.image-preview-del {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  color: var(--text-2);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.image-preview-del:hover {
+  background: var(--red-soft);
+  color: var(--red);
+  border-color: var(--red);
 }
 
 /* ---------- 联网开关（输入框内，默认开启） ---------- */
@@ -1213,4 +1292,164 @@ a.source-name:hover,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ---------- 截图场景选择弹窗（上传图片后三选一） ---------- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(31, 35, 41, 0.42);
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 460px;
+  padding: 22px 22px 18px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: 0 18px 48px rgba(31, 35, 41, 0.22);
+}
+
+.modal-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+  color: var(--text);
+}
+
+.modal-hint {
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+
+.scene-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.scene-card {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 11px 14px;
+  text-align: left;
+  font: inherit;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+}
+
+.scene-card:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.scene-card.selected {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+
+.scene-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.scene-desc {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* 设计稿对比缺图提示：提醒补齐第二张（设计稿 + 页面截图） */
+.scene-image-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 9px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px dashed var(--accent-line);
+  border-radius: 10px;
+}
+
+.image-add-btn {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  font-size: 12.5px;
+  color: #fff;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.image-add-btn:hover {
+  opacity: 0.9;
+}
+
+.modal-note {
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 12px;
+  padding: 9px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  resize: vertical;
+}
+
+.modal-note:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.modal-cancel {
+  padding: 8px 16px;
+  font-size: 13px;
+  color: var(--text-2);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.modal-cancel:hover {
+  background: var(--card-hover);
+}
+
+button.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 统一 [hidden] 的隐藏行为：显式覆盖 display:flex 等作者样式
+   （弹窗遮罩 .modal-overlay、图片预览条 .image-preview 都靠 hidden 开关显隐） */
+[hidden] {
+  display: none !important;
 }

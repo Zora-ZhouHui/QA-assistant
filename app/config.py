@@ -14,9 +14,22 @@ class Settings(BaseSettings):
     )
 
     llm_api_key: str = ""
-    # OpenAI 兼容接口；换厂商只改 base_url / model 两个值
-    llm_base_url: str = "https://api.deepseek.com"
-    llm_model: str = "deepseek-chat"
+    # OpenAI 兼容接口；换厂商只改 base_url / model 两个值。
+    # 当前接阿里云百炼 qwen3.7-plus：模型 ID 必须小写，不能写成开源仓名 Qwen/Qwen3.7-Plus
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    llm_model: str = "qwen3.7-plus"
+
+    # 视觉（多模态）能力：用户上传截图后，先由视觉模型按场景指令把图解析成纯文本，
+    # 该文本再接入 kb_search + web_search 的 RAG 链路。图片统一走 OpenAI 标准
+    # image_url 格式（含 base64 dataURL），换厂商只改下面三项。
+    # qwen3.7-plus 原生支持图文输入，故视觉能力复用同一模型与端点，无需另换模型。
+    # vision_model 留空 = 未启用多模态，带图请求会被明确拦截提示（不静默降级）。
+    vision_model: str = "qwen3.7-plus"
+    vision_base_url: str = ""
+    vision_api_key: str = ""
+
+    # 单张图尺寸上限（前端已压缩，这里是双保险；按 dataURL 字符数计）
+    max_image_bytes: int = 5 * 1024 * 1024
 
     # 本地 embedding 模型（首次运行时自动下载）
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
@@ -29,6 +42,19 @@ class Settings(BaseSettings):
     chunk_size: int = 512       # 每个文本块的最大字符数
     chunk_overlap: int = 64     # 相邻块之间的重叠字符数
     top_k: int = 4              # 每次检索返回的文本块数量
+
+    # 检索管线：dense=纯向量单路（默认，评测证明的最强路径）；hybrid=稠密 + BM25
+    # 稀疏扩池（稀疏不改排序、只为给重排器更多候选）。见 app/services/retrieval/。
+    # 注：重排关闭时 hybrid 与 dense 对 top_k 结果等价，故默认走 dense 避免无谓开销。
+    retrieval_mode: str = "dense"    # dense | hybrid
+    retrieval_candidate_k: int = 20  # 每路召回候选数（融合后的候选池大小）
+
+    # 重排（Cross-Encoder）：对"全部候选池"做精排，代价是额外延迟。
+    # 模型缺失/加载失败时自动降级为不重排（记日志），回退稠密序，不阻断检索。
+    # 默认关闭：评测显示 bge-reranker-base 让 L4 Recall@1 从 84% 掉到 80.5%（负收益），
+    # 更强的 v2-m3 在本机 CPU 上评测不可接受；重排作为可开关能力保留（见 README 评测段）。
+    rerank_enabled: bool = False
+    rerank_model: str = "BAAI/bge-reranker-v2-m3"
 
     # 联网搜索（Tavily）：与 LLM 配置完全独立，换搜索引擎只改 SEARCH_PROVIDER
     search_provider: str = "tavily"

@@ -41,6 +41,21 @@ class VectorStore:
             )
         return self._collections[name]
 
+    def reset(self, *names: str) -> None:
+        """删除指定 collection 并清掉句柄（用于更换 embedding 模型后的重建）。
+
+        换模型后旧向量维度/语义空间都变，必须整表清空重算；
+        不能沿用旧 id 直接 add（Chroma 同 id 重复写入会冲突）。
+        """
+        names = names or (self.DOCS_COLLECTION, self.FAQ_COLLECTION)
+        client = self._ensure_client()
+        for name in names:
+            try:
+                client.delete_collection(name)
+            except Exception as e:
+                print(f"reset {name} failed: {e}")
+            self._collections.pop(name, None)
+
     # ---------- docs：长文档切片 ----------
     def add(
         self,
@@ -151,6 +166,48 @@ class VectorStore:
         merged.sort(key=lambda x: x["score"], reverse=True)
         return merged[:top_k]
 
+    # ---------- 全量读取：供稀疏检索（BM25）建索引 ----------
+    def iter_all(self) -> List[Dict[str, Any]]:
+        """返回两个 collection 的全部条目，供稀疏检索建倒排/BM25 索引。
+
+        结构统一为 {id, text, source, collection}：
+          - docs：id = "doc_id:chunk_index"，text = 切片正文
+          - faq ：id = faq_id，text = 题面（稀疏侧只索引 question，
+                  与稠密侧"只向量化 question"的口径保持一致）
+        """
+        items: List[Dict[str, Any]] = []
+        for name in (self.DOCS_COLLECTION, self.FAQ_COLLECTION):
+            col = self._get_collection(name)
+            try:
+                res = col.get(include=["documents", "metadatas"])
+            except Exception as e:
+                print(f"iter_all {name} failed: {e}")
+                continue
+            docs = res.get("documents") or []
+            metas = res.get("metadatas") or []
+            for doc, meta in zip(docs, metas):
+                if name == self.DOCS_COLLECTION:
+                    doc_id = meta.get("doc_id", "")
+                    ci = meta.get("chunk_index", 0)
+                    items.append(
+                        {
+                            "id": f"{doc_id}:{ci}",
+                            "text": doc,
+                            "source": meta.get("source", ""),
+                            "collection": "docs",
+                        }
+                    )
+                else:
+                    items.append(
+                        {
+                            "id": meta.get("faq_id", ""),
+                            "text": meta.get("question", ""),
+                            "source": meta.get("source_url", ""),
+                            "collection": "faq",
+                        }
+                    )
+        return items
+
     # ---------- 内部：解析 Chroma 返回结构 ----------
     @staticmethod
     def _parse_docs_result(result: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -164,9 +221,11 @@ class VectorStore:
         ):
             items.append(
                 {
+                    "id": f"{meta.get('doc_id', '')}:{meta.get('chunk_index', 0)}",
                     "text": doc,
                     "source": meta.get("source", ""),
                     "doc_id": meta.get("doc_id", ""),
+                    "chunk_index": meta.get("chunk_index", 0),
                     # cosine 距离 0~2 → 相似度 0~1
                     "score": round(1 - distance, 4),
                     "collection": "docs",
@@ -187,6 +246,7 @@ class VectorStore:
             items.append(
                 {
                     # documents 字段存的是 "问：…\n答：…"，直接作为正文返回
+                    "id": meta.get("faq_id", ""),
                     "text": doc,
                     "source": meta.get("source_url", ""),
                     "faq_id": meta.get("faq_id", ""),

@@ -16,9 +16,10 @@
 import argparse
 import json
 import math
+import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from app.config import settings
 from app.core.embeddings import get_embedder
@@ -33,11 +34,9 @@ def _ranked_relevances(pred_ids: List[str], gold_id: str) -> List[float]:
     return [1.0 if pid == gold_id else 0.0 for pid in pred_ids]
 
 
-def score_sample(sample: Dict[str, Any], top_k: int, store, embedder) -> Dict[str, Any]:
-    """对单条样本跑一次 query_faq 检索，返回该样本的各指标与候选序列。"""
-    vec = embedder.embed_query(sample["query"])
-    items = store.query_faq(vec, top_k)
-    pred_ids = [it["faq_id"] for it in items]
+def score_sample(sample: Dict[str, Any], top_k: int, retrieve_fn: Callable[[str], List[str]]) -> Dict[str, Any]:
+    """对单条样本跑一次检索（走哪条管线由 retrieve_fn 决定），返回各指标与候选序列。"""
+    pred_ids = retrieve_fn(sample["query"])
     gold = sample["faq_id"]
     rels = _ranked_relevances(pred_ids, gold)
     return {
@@ -49,6 +48,36 @@ def score_sample(sample: Dict[str, Any], top_k: int, store, embedder) -> Dict[st
         "pred_ids": pred_ids,
         "gold": gold,
     }
+
+
+def build_retrieve_fn(
+    pipeline: str, top_k: int, store, embedder
+) -> Callable[[str], List[str]]:
+    """按 --pipeline 选择检索路径，返回"query → 有序 faq_id 列表"的闭包。
+
+    dense          —— 改造前的纯向量单路（基线，用于对照）
+    hybrid         —— 稠密 + BM25，RRF 融合，不重排
+    hybrid_rerank  —— 在上者基础上加 Cross-Encoder 重排
+    三档跑同一评测集，才能把"融合"与"重排"各自的净贡献隔离出来。
+    """
+    if pipeline == "dense":
+        def fn(query: str) -> List[str]:
+            vec = embedder.embed_query(query)
+            return [it["faq_id"] for it in store.query_faq(vec, top_k)]
+        return fn
+
+    from app.services.retrieval import get_retriever
+
+    retriever = get_retriever()
+    use_rerank = pipeline == "hybrid_rerank"
+
+    def fn(query: str) -> List[str]:
+        items = retriever.retrieve(
+            query, top_k, collections=("faq",), mode="hybrid", use_rerank=use_rerank
+        )
+        return [it.get("faq_id") or it.get("id", "") for it in items]
+
+    return fn
 
 
 def pick_one_score(
@@ -94,20 +123,35 @@ def negative_discrimination(sample: Dict[str, Any], pred_ids: List[str]) -> floa
     return 1.0
 
 
+def _p95(values: List[float]) -> float:
+    """P95 延迟（毫秒）；样本过少时退化为最大值。"""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, math.ceil(0.95 * len(ordered)) - 1))
+    return ordered[idx]
+
+
 def summarize(
-    samples: List[Dict[str, Any]], top_k: int, store, faq_questions: Dict[str, str]
+    samples: List[Dict[str, Any]],
+    top_k: int,
+    retrieve_fn: Callable[[str], List[str]],
+    faq_questions: Dict[str, str],
+    embedder,
 ) -> Dict[str, Any]:
-    """对一批样本逐条打分并聚合，返回各指标均值与诊断明细。"""
-    embedder = get_embedder()
+    """对一批样本逐条打分并聚合，返回各指标均值、延迟与诊断明细。"""
     acc: Dict[str, List[float]] = defaultdict(list)
     disc: List[float] = []
     pick: List[float] = []
     gold_ranks: List[int] = []
+    latencies: List[float] = []
     surfaced_negs: int = 0
     misses: List[Dict[str, Any]] = []
 
     for s in samples:
-        r = score_sample(s, top_k, store, embedder)
+        t0 = time.perf_counter()
+        r = score_sample(s, top_k, retrieve_fn)
+        latencies.append((time.perf_counter() - t0) * 1000)
         for key in ("recall", "hit", "mrr", "rank1", "ndcg"):
             acc[key].append(r[key])
 
@@ -131,6 +175,8 @@ def summarize(
         "discrimination": mean(disc),
         "pick_one": mean(pick),
         "gold_rank_mean": mean(gold_ranks),
+        "latency_mean_ms": mean(latencies),
+        "latency_p95_ms": _p95(latencies),
         "surfaced_negatives": surfaced_negs,
         "miss_count": len(misses),
     }
@@ -170,6 +216,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="检索层评测 v2（判别力版）")
     parser.add_argument("--top-k", type=int, default=settings.top_k, help="报告的最大 K")
     parser.add_argument(
+        "--pipeline",
+        choices=["dense", "hybrid", "hybrid_rerank"],
+        default="dense",
+        help="检索路径：dense=改造前基线；hybrid=+BM25 融合；hybrid_rerank=+重排",
+    )
+    parser.add_argument(
+        "--json-out",
+        type=str,
+        default="",
+        help="把本次结果写入 JSON（用于三档对照，如 data/eval_runs/dense.json）",
+    )
+    parser.add_argument(
         "--set",
         type=str,
         default=str(settings.data_dir / "eval_retrieval_set.json"),
@@ -192,6 +250,13 @@ def main() -> None:
     store = get_vector_store()
     n_pool = store.count_faq()
     faq_questions = {r.faq_id: r.question for r in load_all_faqs()}
+    embedder = get_embedder()
+    # 预热稀疏索引：把 BM25 构建耗时排除在逐条检索延迟之外（否则首条会异常高）
+    if args.pipeline != "dense":
+        from app.services.retrieval import get_retriever
+
+        get_retriever().ensure_sparse()
+    retrieve_fn = build_retrieve_fn(args.pipeline, args.top_k, store, embedder)
 
     by_level: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for s in samples:
@@ -206,7 +271,7 @@ def main() -> None:
     print("检索层评测 v2（判别力版）")
     print("=" * 60)
     print(f"评测集：{len(samples)} 条（每道 gold 题 L1/L2/L3/L4 各 1 条）")
-    print(f"FAQ 库总量 N={n_pool}，检索 K={args.top_k}")
+    print(f"FAQ 库总量 N={n_pool}，检索 K={args.top_k}，检索路径={args.pipeline}")
     print()
 
     base = random_baseline(n_pool, args.top_k, pick_size)
@@ -221,7 +286,7 @@ def main() -> None:
     for level, title in [("L1", "同义改写"), ("L2", "口语化"), ("L3", "难负例"), ("L4", "激进改写")]:
         if level not in by_level:
             continue
-        res = summarize(by_level[level], args.top_k, store, faq_questions)
+        res = summarize(by_level[level], args.top_k, retrieve_fn, faq_questions, embedder)
         level_results[level] = res
         print(f"【{level} · {title}】")
         print(f"    Recall@1       = {_fmt_pct(res['rank1'])}")
@@ -236,6 +301,7 @@ def main() -> None:
             print(f"    gold 平均排名  = {res['gold_rank_mean']:.2f}（越接近 1 越好）")
             print(f"    被误拉进 top_k 的负例数 = {res['surfaced_negatives']}")
         print(f"    未命中（gold 未入 top_k）：{res['miss_count']} 条")
+        print(f"    单条检索延迟   = 均值 {res['latency_mean_ms']:.1f}ms / P95 {res['latency_p95_ms']:.1f}ms")
         print()
 
     print("【判别力小结】")
@@ -250,6 +316,20 @@ def main() -> None:
         lift = level_results["L4"]["pick_one"] / base["pick_one"] if base["pick_one"] else 0.0
         print(f"  L4 单选选对率 {_fmt_pct(level_results['L4']['pick_one'])}"
               f"相对随机基线提升：{lift:.1f}x")
+
+    if args.json_out:
+        out = {
+            "pipeline": args.pipeline,
+            "top_k": args.top_k,
+            "n_pool": n_pool,
+            "baseline": base,
+            "levels": level_results,
+        }
+        out_path = Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        print(f"\n结果已写入：{out_path}")
 
 
 if __name__ == "__main__":

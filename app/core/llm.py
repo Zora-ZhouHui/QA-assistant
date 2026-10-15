@@ -1,6 +1,6 @@
 """LLM 大模型客户端。
 
-走 OpenAI 兼容接口（当前接 DeepSeek deepseek-chat），直接用官方 openai SDK，
+走 OpenAI 兼容接口（当前接阿里云百炼 qwen3.7-plus），直接用官方 openai SDK，
 通过 base_url + api_key 切换厂商；换模型只改 .env，无需改代码。
 
 Agent 支持：
@@ -16,21 +16,25 @@ from app.config import settings
 
 class LLMClient:
     def __init__(self) -> None:
-        self._client = None
+        # 按 (base_url, api_key) 缓存多个 client，支持文本/视觉模型走不同厂商端点
+        self._clients: Dict[tuple, Any] = {}
 
-    def _ensure_client(self):
-        if self._client is None:
-            if not settings.llm_api_key:
-                raise RuntimeError(
-                    "未配置 LLM_API_KEY：请复制 .env.example 为 .env 并填入你的密钥"
-                )
+    def _ensure_client(self, base_url: str = "", api_key: str = ""):
+        base_url = base_url or settings.llm_base_url
+        api_key = api_key or settings.llm_api_key
+        if not api_key:
+            raise RuntimeError(
+                "未配置 LLM_API_KEY：请复制 .env.example 为 .env 并填入你的密钥"
+            )
+        key = (base_url, api_key)
+        if key not in self._clients:
             from openai import AsyncOpenAI
 
-            self._client = AsyncOpenAI(
-                api_key=settings.llm_api_key,
-                base_url=settings.llm_base_url,
+            self._clients[key] = AsyncOpenAI(
+                api_key=api_key,
+                base_url=base_url,
             )
-        return self._client
+        return self._clients[key]
 
     async def stream_chat(
         self,
@@ -52,6 +56,10 @@ class LLMClient:
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        *,
+        model: str = "",
+        base_url: str = "",
+        api_key: str = "",
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """流式对话，产出事件流：
           {"type": "token", "content": str}        —— 回答文本增量
@@ -62,12 +70,16 @@ class LLMClient:
         流式协议下 tool_calls 是分片到达的（按 index 增量拼 arguments），
         这里负责拼装成完整的标准结构，调用方（agent loop）无需感知分片细节。
         """
-        client = self._ensure_client()
+        client = self._ensure_client(base_url, api_key)
         kwargs: Dict[str, Any] = {
-            "model": settings.llm_model,
+            "model": model or settings.llm_model,
             "messages": messages,
             "stream": True,
             "temperature": 0.3,  # 知识问答场景调低温度，减少发挥
+            # 百炼系模型（qwen3.7-plus 等）默认开启思考模式：思考内容走 reasoning_content
+            # 字段（本客户端只消费 content，会静默丢弃），且思考 token 按输出计费。
+            # 显式关闭以降低延迟与成本；该参数非 OpenAI 标准，必须经 extra_body 传入。
+            "extra_body": {"enable_thinking": False},
         }
         if tools:
             kwargs["tools"] = tools

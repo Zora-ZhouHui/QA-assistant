@@ -5,14 +5,169 @@ const sendBtn = document.getElementById('sendBtn');
 const sessionListEl = document.getElementById('sessionList');
 const newSessionBtn = document.getElementById('newSessionBtn');
 const webSearchCheck = document.getElementById('webSearchCheck');
+const imageBtn = document.getElementById('imageBtn');
+const imageInput = document.getElementById('imageInput');
+const imagePreviewEl = document.getElementById('imagePreview');
+// 截图场景三选一弹窗
+const sceneModalEl = document.getElementById('sceneModal');
+const sceneOptionsEl = document.getElementById('sceneOptions');
+const sceneNoteEl = document.getElementById('sceneNote');
+const sceneConfirmBtn = document.getElementById('sceneConfirm');
+// 设计稿对比缺图提示（需两张图：设计稿 + 页面截图）
+const sceneImageHintEl = document.getElementById('sceneImageHint');
+const sceneImageHintTextEl = document.getElementById('sceneImageHintText');
+const sceneAddImageBtn = document.getElementById('sceneAddImageBtn');
+
+// 场景 key → 显示名（与后端 app/agent/scenes.py 的 SCENE_LABELS 保持一致）
+const SCENE_LABELS = {
+  console_error: '控制台报错截图',
+  layout_misalign: '布局错位截图',
+  design_compare: '设计稿对比截图',
+};
 
 // 当前会话 id（存 localStorage，刷新后仍能回到同一会话）
 let currentSessionId = localStorage.getItem('session_id');
+
+// 待发送的图片（base64 dataURL 列表），发送成功后清空
+let pendingImages = [];
+
+// 弹窗中被选中的场景 key（未选为空）
+let selectedScene = '';
 
 // ---------- 工具：生成 UUID ----------
 function genId() {
   return crypto.randomUUID ? crypto.randomUUID()
     : 'sess-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+}
+
+// ---------- 图片：压缩 + 预览 + 增删 ----------
+// 前端压缩：最长边缩到 maxDim，转 JPEG；截图文字密集，分辨率与质量取偏保真值
+function compressImage(file, maxDim = 1400, quality = 0.85) {
+  return new Promise((resolve, reject) => {
+    if (!file || !file.type.startsWith('image/')) {
+      reject(new Error('非图片文件'));
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('图片加载失败')); };
+    img.src = url;
+  });
+}
+
+async function addImageFiles(files) {
+  const list = Array.from(files || []).filter(f => f.type && f.type.startsWith('image/'));
+  for (const f of list) {
+    try {
+      pendingImages.push(await compressImage(f));
+    } catch (e) {
+      console.error('图片处理失败', e);
+    }
+  }
+  renderImagePreview();
+  // 有了待发图片 → 弹出场景选择（已有弹窗打开时不重置用户的选择）
+  if (pendingImages.length && sceneModalEl.hidden) {
+    openSceneModal();
+  } else if (!sceneModalEl.hidden) {
+    // 弹窗开着补图（如设计稿对比第二张）→ 刷新缺图提示与发送可用态
+    refreshSceneConfirm();
+  }
+}
+
+// ---------- 截图场景选择弹窗（上传图片后三选一） ----------
+// 场景所需最少图片数：设计稿对比需两张（设计稿 + 页面截图），其余一张
+function sceneMinImages(scene) {
+  return scene === 'design_compare' ? 2 : 1;
+}
+
+// 刷新底部缺图提示与"开始解析"可用态：设计稿对比缺图时提示补齐并禁用发送
+function refreshSceneConfirm() {
+  const need = sceneMinImages(selectedScene);
+  const missing = Math.max(0, need - pendingImages.length);
+  const showHint = selectedScene === 'design_compare' && missing > 0;
+
+  sceneConfirmBtn.disabled = !selectedScene || missing > 0;
+  sceneImageHintEl.hidden = !showHint;
+  if (showHint) {
+    sceneImageHintTextEl.textContent =
+      `设计稿对比需两张图：①设计稿 ②页面截图（当前 ${pendingImages.length}/${need}），请继续粘贴或点「添加图片」`;
+  }
+}
+
+// 打开弹窗：清空选择，把输入框已有的文字带进"补充说明"（用户可能先打了字再传图）
+function openSceneModal() {
+  selectedScene = '';
+  sceneNoteEl.value = inputEl.value.trim();
+  sceneOptionsEl.querySelectorAll('.scene-card').forEach(c => c.classList.remove('selected'));
+  sceneModalEl.hidden = false;
+  refreshSceneConfirm();
+}
+
+function closeSceneModal() {
+  sceneModalEl.hidden = true;
+}
+
+// 点卡片即选中（高亮），"开始解析"按钮随图片数是否满足而定
+sceneOptionsEl.addEventListener('click', (e) => {
+  const card = e.target.closest('.scene-card');
+  if (!card) return;
+  selectedScene = card.dataset.scene;
+  sceneOptionsEl.querySelectorAll('.scene-card')
+    .forEach(c => c.classList.toggle('selected', c === card));
+  refreshSceneConfirm();
+});
+
+// 选定场景 → 关闭弹窗 → 带场景发起（补充说明作为 question 传给后端）
+sceneConfirmBtn.onclick = () => {
+  if (!selectedScene) return;
+  // 设计稿对比图片不足时不发送，只刷新提示
+  if (sceneMinImages(selectedScene) > pendingImages.length) {
+    refreshSceneConfirm();
+    return;
+  }
+  inputEl.value = sceneNoteEl.value.trim();
+  closeSceneModal();
+  sendQuestion(selectedScene);
+};
+
+// 弹窗内补图入口：复用隐藏文件选择（与输入区"图片"按钮一致）
+sceneAddImageBtn.onclick = () => imageInput.click();
+
+document.getElementById('sceneCancel').onclick = closeSceneModal;
+
+function removePendingImage(i) {
+  pendingImages.splice(i, 1);
+  renderImagePreview();
+}
+
+function renderImagePreview() {
+  imagePreviewEl.innerHTML = '';
+  if (!pendingImages.length) {
+    imagePreviewEl.hidden = true;
+    return;
+  }
+  imagePreviewEl.hidden = false;
+  pendingImages.forEach((dataUrl, i) => {
+    const item = document.createElement('div');
+    item.className = 'image-preview-item';
+    const img = document.createElement('img');
+    img.src = dataUrl;
+    const del = document.createElement('button');
+    del.className = 'image-preview-del';
+    del.textContent = '✕';
+    del.onclick = () => removePendingImage(i);
+    item.append(img, del);
+    imagePreviewEl.appendChild(item);
+  });
 }
 
 // ---------- Markdown 渲染（本地 vendor 库，DOMPurify 消毒防 XSS） ----------
@@ -44,12 +199,19 @@ function renderAnswerHTML(text, sourcesCount, withCitations) {
 
 // ---------- 消息渲染 ----------
 // bot/assistant 消息 = 头像 + 全宽正文（Markdown 渲染）；user 消息 = 右侧气泡（纯文本）
-function addMessage(role, text) {
+// images 为可选附件（dataURL 列表），user 消息在文字下方渲染缩略图
+function addMessage(role, text, images) {
   const div = document.createElement('div');
   div.className = `msg ${role === 'user' ? 'user' : 'bot'}`;
 
   if (role === 'user') {
     div.textContent = text;
+    (images || []).forEach(dataUrl => {
+      const img = document.createElement('img');
+      img.className = 'msg-image';
+      img.src = dataUrl;
+      div.appendChild(img);
+    });
   } else {
     const avatar = document.createElement('div');
     avatar.className = 'avatar';
@@ -99,6 +261,7 @@ if (localStorage.getItem('logCollapsed') === '1') logPanelEl.classList.add('coll
 let activeToolStep = null; // 当前进行中的工具步骤 {el, start}
 let llmStep = null;        // 进行中的"模型调用"步骤 {el}（决策/生成共用，按后续事件定型）
 let answerStep = null;     // 回答步骤 {el, start}
+let visionStep = null;     // 进行中的"图片解析"步骤 {el, start}（仅截图问答）
 let toolSeq = 0;           // 本轮工具调用序号（回答"第几次搜索"）
 let llmCalls = 0;          // 本轮模型调用总次数（决策 + 生成）
 let decisionCalls = 0;     // 其中"决策"次数（以调用工具告终的调用）
@@ -118,6 +281,7 @@ function resetLog() {
   logListEl.innerHTML = `<p class="log-empty">${LOG_EMPTY}</p>`;
   activeToolStep = null;
   answerStep = null;
+  visionStep = null;
   toolSeq = 0;
   qaStart = 0;
 }
@@ -144,6 +308,37 @@ function logQuestion(question) {
     '<span class="log-action">用户问题</span>' +
     `<span class="log-time">${nowTime()}</span></div>` +
     `<div class="log-detail">${escapeHtml(question)}</div>`;
+}
+
+// 截图问答的日志入口：新一轮问答先记"图片解析"（替代文字问答的"提问"节点）
+function logSceneStart(label) {
+  resetLog();
+  qaStart = performance.now();
+  setLogCollapsed(false);  // 日志开始生成 → 自动展开面板
+  const step = appendStep('running');
+  step.innerHTML =
+    '<span class="log-node spin"></span>' +
+    '<div class="log-head"><span class="log-kind model">多模态</span>' +
+    `<span class="log-action">图片解析 · ${escapeHtml(label)}</span>` +
+    `<span class="log-time">${nowTime()}</span></div>`;
+  visionStep = { el: step, start: performance.now() };
+}
+
+// 图片解析完成：收起进行中标记，补上耗时
+function logVisionDone() {
+  if (!visionStep) return;
+  const { el, start } = visionStep;
+  const secs = ((performance.now() - start) / 1000).toFixed(1);
+  el.classList.remove('running');
+  el.classList.add('ok');
+  el.querySelector('.log-node').classList.remove('spin');
+  el.querySelector('.log-action').textContent = '图片解析完成';
+  const meta = document.createElement('div');
+  meta.className = 'log-meta';
+  meta.textContent = `解析耗时 ${secs}s`;
+  el.appendChild(meta);
+  visionStep = null;
+  logListEl.scrollTop = logListEl.scrollHeight;
 }
 
 // 模型调用开始：Agent 每轮循环先请求一次模型，要么决策调用工具，要么直接生成
@@ -524,6 +719,9 @@ async function createSession() {
   currentSessionId = data.session_id;
   localStorage.setItem('session_id', currentSessionId);
   inputEl.value = '';
+  pendingImages = [];
+  renderImagePreview();
+  closeSceneModal();
   renderChatWelcome();
   setLogCollapsed(true);  // 新会话无日志 → 自动收起面板
   await loadSessions();
@@ -553,6 +751,9 @@ async function switchSession(id) {
   currentSessionId = id;
   localStorage.setItem('session_id', currentSessionId);
   inputEl.value = '';
+  pendingImages = [];
+  renderImagePreview();
+  closeSceneModal();
   await loadSessionMessages(id);
   await loadSessions();
 }
@@ -568,8 +769,8 @@ async function loadSessionMessages(id) {
     renderChatWelcome();
     return;
   }
-  // 后端返回正序（旧→新），直接逐条 append 即可
-  msgs.forEach(m => addMessage(m.role, m.content));
+  // 后端返回正序（旧→新），直接逐条 append 即可；图片附件随消息一并回放
+  msgs.forEach(m => addMessage(m.role, m.content, m.images || null));
   // 回放该会话的历史执行轨迹（有则渲染，替代空状态；面板仍保持收起，展开即可见）
   await loadTraceForSession(id);
 }
@@ -591,7 +792,7 @@ function renderTrace(events) {
   const empty = logListEl.querySelector('.log-empty');
   if (empty) empty.remove();
 
-  let modelEl = null, modelCall = 0, toolEl = null;
+  let modelEl = null, modelCall = 0, toolEl = null, visionEl = null;
 
   const relabelModel = (text) => {
     if (!modelEl) return;
@@ -613,6 +814,23 @@ function renderTrace(events) {
         '<div class="log-head"><span class="log-kind question">提问</span>' +
         '<span class="log-action">用户问题</span></div>' +
         `<div class="log-detail">${escapeHtml(evt.question || '')}</div>`;
+    } else if (evt.type === 'vision_start') {
+      // 截图问答：多模态解析节点（先于该轮的"提问/模型/检索"节点出现）
+      if (modelEl) relabelModel(`第 ${modelCall} 次调用 · 生成回答`);
+      toolEl = null;
+      visionEl = appendStep('running');
+      visionEl.innerHTML =
+        '<span class="log-node spin"></span>' +
+        '<div class="log-head"><span class="log-kind model">多模态</span>' +
+        `<span class="log-action">图片解析 · ${escapeHtml(evt.label || '')}</span></div>`;
+    } else if (evt.type === 'vision_done') {
+      if (visionEl) {
+        visionEl.classList.remove('running');
+        visionEl.classList.add('ok');
+        visionEl.querySelector('.log-node').classList.remove('spin');
+        visionEl.querySelector('.log-action').textContent = '图片解析完成';
+        visionEl = null;
+      }
     } else if (evt.type === 'llm_start') {
       if (modelEl) relabelModel(`第 ${modelCall} 次调用 · 生成回答`);
       modelCall = evt.call;
@@ -701,14 +919,27 @@ function renderChatWelcome() {
 }
 
 // ---------- 问答（SSE 流式） ----------
-async function sendQuestion() {
-  const question = inputEl.value.trim();
-  if (!question) return;
+// scene 为空 = 原有文字问答入口（行为不变）；scene 非空 = 截图问答（场景 key）
+async function sendQuestion(scene) {
+  let question = inputEl.value.trim();
+  const images = pendingImages.slice();
+  if (!images.length && !question) return;
   inputEl.value = '';
   sendBtn.disabled = true;
 
-  addMessage('user', question);
-  logQuestion(question);  // 右侧日志：新一轮问答，先记提问并清空上一轮日志
+  // 图片随本轮发出，清空待发送队列与预览
+  pendingImages = [];
+  renderImagePreview();
+
+  // 用户气泡：图片问答与纯文字问答统一，只含用户文字 + 图片；
+  // 图片解析（vision）是模型侧行为，归属模型气泡的 thinking 区域。
+  addMessage('user', question, images.length ? images : null);
+  if (scene) {
+    const label = SCENE_LABELS[scene] || '截图';
+    logSceneStart(label);  // 右侧日志：先记"图片解析"节点并清空上一轮日志
+  } else {
+    logQuestion(question);  // 右侧日志：新一轮问答，先记提问并清空上一轮日志
+  }
   // 立即创建助手消息骨架（含"思考中"占位），检索期间页面不再空白
   const built = buildBotMessage();
   let { body, answerEl, thinking } = built;
@@ -728,6 +959,8 @@ async function sendQuestion() {
         question,
         session_id: currentSessionId,
         web_search_enabled: webSearchCheck.checked,
+        images: images,
+        scene: scene || '',
       }),
     });
 
@@ -747,7 +980,16 @@ async function sendQuestion() {
         if (!line) continue;
         const evt = JSON.parse(line.slice(6));
 
-        if (evt.type === 'llm_start') {
+        if (evt.type === 'vision_start') {
+          // 图片解析开始：模型侧 thinking 更新为"正在解析图片…"
+          if (thinking) thinking.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span> 正在解析图片…';
+        } else if (evt.type === 'vision_token') {
+          // 解析文本是模型中间产物，不再展示到聊天气泡（右侧日志已有记录）
+        } else if (evt.type === 'vision_done') {
+          // 解析结束：thinking 恢复为"思考中…"，进入 Agent 工具循环
+          if (thinking) thinking.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span> 思考中';
+          logVisionDone();
+        } else if (evt.type === 'llm_start') {
           // 右侧日志：模型第 N 次调用开始（是决策还是生成，由后续事件定型）
           logLlmStart(evt.call);
         } else if (evt.type === 'kb_searching') {
@@ -836,11 +1078,54 @@ async function sendQuestion() {
 }
 
 // ---------- 事件绑定 ----------
-sendBtn.onclick = sendQuestion;
+// 待发图片存在 → 先弹场景选择（选定后由弹窗发起）；否则走原文字问答入口
+function handleSend() {
+  if (pendingImages.length) {
+    openSceneModal();
+    return;
+  }
+  sendQuestion();
+}
+
+sendBtn.onclick = handleSend;
+
+// 图片上传：点按钮 → 触发文件选择（支持多选）
+imageBtn.onclick = () => imageInput.click();
+imageInput.addEventListener('change', e => {
+  addImageFiles(e.target.files);
+  imageInput.value = '';  // 允许连续选择同一文件
+});
+
+// 粘贴截图：剪贴板含图片时拦截并取图压缩入队；纯文本粘贴放行。
+// 挂到 document 层，弹窗打开时补第二张图也能粘贴（不依赖输入框聚焦）
+document.addEventListener('paste', e => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const files = [];
+  for (const it of items) {
+    if (it.type && it.type.startsWith('image/')) {
+      const f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (files.length) {
+    e.preventDefault();
+    addImageFiles(files);
+  }
+});
+
+// 拖拽截图到聊天区
+const chatEl = document.querySelector('.chat');
+chatEl.addEventListener('dragover', e => { e.preventDefault(); });
+chatEl.addEventListener('drop', e => {
+  e.preventDefault();
+  addImageFiles(e.dataTransfer && e.dataTransfer.files);
+});
+
 inputEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
-    sendQuestion();
+    handleSend();
   }
 });
 newSessionBtn.onclick = createSession;

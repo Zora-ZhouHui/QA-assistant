@@ -3,12 +3,16 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic-settings>=2.2       # .env 配置读取
 
-# 大模型（走 OpenAI 兼容接口，当前接 DeepSeek）
+# 大模型（走 OpenAI 兼容接口，当前接阿里云百炼 qwen3.7-plus）
 openai>=1.30
 
 # RAG：本地 embedding 模型 + 向量库
 sentence-transformers>=3.0   # 首次运行会自动下载 bge 模型（约 100MB）
 chromadb>=0.5                # 本地嵌入式向量库
+
+# 混合检索：稀疏(BM25) 一路 + 中文分词
+rank_bm25>=0.2               # BM25Okapi，纯 Python，无外部依赖
+jieba>=0.42                  # 中文分词（BM25 词项切分；缺失时自动退化为纯稠密）
 
 # 文档解析
 beautifulsoup4>=4.12         # HTML

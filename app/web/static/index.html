@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>知识问答助手</title>
-  <link rel="stylesheet" href="/static/style.css?v=13">
+  <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 
 <body>
@@ -34,8 +34,11 @@
         </div>
       </div>
       <div class="input-bar">
+        <div id="imagePreview" class="image-preview" hidden></div>
         <div class="input-shell">
-          <textarea id="questionInput" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+          <button id="imageBtn" class="image-btn" title="上传截图（也可直接粘贴或拖拽）">图片</button>
+          <input type="file" id="imageInput" accept="image/*" multiple hidden>
+          <textarea id="questionInput" rows="1" placeholder="输入问题，Enter 发送，Shift+Enter 换行；支持粘贴/拖拽截图"></textarea>
           <label class="web-toggle" title="允许助手自动联网搜索最新信息">
             <input type="checkbox" id="webSearchCheck" checked>
             <span class="web-toggle-track"></span>
@@ -57,9 +60,40 @@
       <button id="logRail" class="log-rail" title="展开日志面板">执行日志</button>
     </aside>
   </div>
+  <!-- 截图场景三选一弹窗：上传图片后弹出，选定场景后即开始多模态解析 -->
+  <div id="sceneModal" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <h3 class="modal-title">选择截图场景</h3>
+      <p class="modal-hint">助手将按所选场景用多模态模型解析图片，再结合本地知识库与联网作答</p>
+      <div class="scene-options" id="sceneOptions">
+        <button type="button" class="scene-card" data-scene="console_error">
+          <span class="scene-name">控制台报错截图</span>
+          <span class="scene-desc">提取报错信息、错误栈、触发场景</span>
+        </button>
+        <button type="button" class="scene-card" data-scene="layout_misalign">
+          <span class="scene-name">布局错位截图</span>
+          <span class="scene-desc">识别页面元素、容器尺寸、flex/grid 与偏移量</span>
+        </button>
+        <button type="button" class="scene-card" data-scene="design_compare">
+          <span class="scene-name">设计稿对比截图</span>
+          <span class="scene-desc">标注颜色、尺寸、间距的视觉还原差异</span>
+        </button>
+      </div>
+      <div id="sceneImageHint" class="scene-image-hint" hidden>
+        <span id="sceneImageHintText"></span>
+        <button type="button" id="sceneAddImageBtn" class="image-add-btn">添加图片</button>
+      </div>
+      <textarea id="sceneNote" class="modal-note" rows="2" placeholder="补充说明（可选）：如报错的操作步骤、期望的布局效果…"></textarea>
+      <div class="modal-actions">
+        <button type="button" id="sceneCancel" class="modal-cancel">取消</button>
+        <button type="button" id="sceneConfirm" class="primary" disabled>开始解析</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/purify.min.js"></script>
-  <script src="/static/app.js?v=17"></script>
+  <script src="/static/app.js?v=20"></script>
 </body>
 
 </html>

@@ -29,8 +29,8 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 from app.agent.prompts import build_system_messages
 from app.agent.tools import TOOL_EXECUTORS, get_tools
 from app.config import settings
+from app.core.contracts import SessionMemory
 from app.core.llm import get_llm_client
-from app.services.memory import SessionMemory
 
 # Agent 执行日志：服务端控制台可见完整决策轨迹（uvicorn 启动即输出）
 logger = logging.getLogger("app.agent")
@@ -66,6 +66,8 @@ class AgentService:
           {"type": "web_sources", "documents": [...]}  —— 网页资料（编号接续 KB 之后）
           {"type": "search_failed", ...}               —— 检索失败/空结果
         """
+        # question 是纯文本：文字问答为用户原问题，截图问答为多模态解析结果，
+        # 两者在此完全等价——本循环只认文字，不感知图片来源（见 routes_chat.py）。
         messages = build_system_messages(question, memory)
         llm = get_llm_client()
 
@@ -104,7 +106,7 @@ class AgentService:
             yield {"type": "llm_start", "call": llm_calls, "round": executed_rounds + 1}
 
             async for event in llm.stream_chat_with_tools(
-                messages, tools=tools or None
+                messages, tools=tools or None,
             ):
                 if event["type"] == "token":
                     yield event
