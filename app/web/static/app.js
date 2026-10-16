@@ -266,6 +266,7 @@ let toolSeq = 0;           // 本轮工具调用序号（回答"第几次搜索"
 let llmCalls = 0;          // 本轮模型调用总次数（决策 + 生成）
 let decisionCalls = 0;     // 其中"决策"次数（以调用工具告终的调用）
 let qaStart = 0;           // 本轮问答起始时间
+let liveStreaming = false; // 是否正在流式接收回答（轨迹回放需避让，避免与实时节点叠加）
 
 function escapeHtml(s) {
   return (s || '').replace(/[&<>"']/g, c => (
@@ -282,6 +283,9 @@ function resetLog() {
   activeToolStep = null;
   answerStep = null;
   visionStep = null;
+  llmStep = null;          // 清空进行中的"模型调用"步骤，避免跨轮残留
+  llmCalls = 0;            // 计数器随新一轮归零，避免跨问题累计
+  decisionCalls = 0;
   toolSeq = 0;
   qaStart = 0;
 }
@@ -481,7 +485,8 @@ function logAnswerDone() {
   }
   if (qaStart) {
     const total = ((performance.now() - qaStart) / 1000).toFixed(1);
-    const summary = llmCalls ? `模型调用 ${llmCalls} 次（决策 ${decisionCalls} + 生成 1）` : '';
+    const genCalls = Math.max(0, llmCalls - decisionCalls);  // 生成次数 = 总调用 - 决策调用，避免写死 1 导致拆解自相矛盾
+    const summary = llmCalls ? `模型调用 ${llmCalls} 次（决策 ${decisionCalls} + 生成 ${genCalls}）` : '';
     const step = appendStep('info');
     step.innerHTML = `<span class="log-node"></span><div class="log-meta">本轮总耗时 ${total}s${summary ? ' · ' + summary : ''}</div>`;
   }
@@ -789,6 +794,9 @@ async function loadTraceForSession(id) {
 // 静态回放一段执行轨迹（区别于 sendQuestion 内的实时流式渲染，
 // 这里直接渲染最终态：决策/生成、检索词、命中数、结果列表、失败信息，不做耗时计时）。
 function renderTrace(events) {
+  // 实时流进行中不回放：否则轨迹节点会叠加到实时时间线上，造成顺序错乱
+  if (liveStreaming) return;
+  resetLog();  // 回放前先清空既有节点，防止与上一轮日志叠加
   const empty = logListEl.querySelector('.log-empty');
   if (empty) empty.remove();
 
@@ -926,6 +934,7 @@ async function sendQuestion(scene) {
   if (!images.length && !question) return;
   inputEl.value = '';
   sendBtn.disabled = true;
+  liveStreaming = true;
 
   // 图片随本轮发出，清空待发送队列与预览
   pendingImages = [];
@@ -1074,6 +1083,7 @@ async function sendQuestion(scene) {
     answerEl.appendChild(errEl);
   } finally {
     sendBtn.disabled = false;
+    liveStreaming = false;
   }
 }
 

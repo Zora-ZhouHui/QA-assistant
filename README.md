@@ -1,23 +1,21 @@
-# 知识检索 Agent · Agentic RAG 问答助手
+# Roma 智能助手
 
-一个把**检索决策权交给模型**的知识问答系统：模型像真正的 Agent 一样自主判断"要不要查、查本地还是联网、查几轮"，而不是每个问题都机械地先走一遍向量检索。后端 FastAPI + SSE 流式输出，前端原生 HTML/CSS/JS 三栏界面，并实时可视化 Agent 的完整决策链路。
-
-- **混合知识源**：本地文档 + 1293 道 Agent 面试题库（Chroma 双 Collection 统一检索）+ Tavily 联网搜索
-- **Agent 工具循环**：基于 OpenAI function calling 标准协议实现 ReAct 循环，换模型厂商零代码改动
-- **截图问答**：上传前端截图 → 选定场景 → 多模态模型按指令解析成纯文本 → 接入同一套 Agent 工具循环（决策与检索逻辑完全复用）
-- **全链路可观测**：右侧"执行日志"面板实时展示每次模型调用（决策/生成）、检索词、命中条数、耗时与返回结果
-- **长对话记忆**：可读文件存储 + 滚动摘要压缩，早期对话压成摘要、近期对话保留原文
-- **开箱即用**：题库随仓库发布，无需任何外部数据库或 Node 构建；首次启动自动建库
-
-### 一眼看懂
+把**检索决策权交给模型**的知识问答 Agent：模型像真正的 Agent 一样自主判断"要不要查、查本地还是联网、查几轮"，而不是每个问题都机械地先走一遍向量检索。后端 FastAPI + SSE 流式输出，前端原生 HTML/CSS/JS 三栏界面，并实时可视化 Agent 的完整决策链路。
 
 | 维度   | 亮点                                                                 |
 | ------ | ------------------------------------------------------------------ |
 | 定位   | Agentic RAG：模型自决「查不查 / 查本地还是联网 / 查几轮」，而非写死的 naive RAG |
+| 差异化 | 截图问答：上传前端截图（控制台报错 / 布局错位 / 设计稿对比）→ 多模态解析成纯文本 → 复用同一套 Agent 检索链路 |
 | 架构   | 四层依赖单向隔离，编排层不感知厂商与引擎，换模型只改 `.env`                       |
-| 数据   | 1293 道 Agent 面试题库 + 本地文档 + Tavily 联网，Chroma 双 Collection 统一检索  |
+| 数据   | 1293 道 Agent 面试题库 + 本地文档 + Tavily 联网，Chroma 双表统一检索  |
 | 可观测 | 决策 / 生成分离的模型调用轨迹，SSE 事件流实时映射成可折叠时间线                     |
 | 评测   | 检索 / 生成 / 引用三层评测，L4 激进改写 Recall@1 84%（随机下界 0.08%）         |
+
+clone 即用：题库随仓库发布，无需任何外部数据库或 Node 构建，首次启动自动建库。
+
+### 界面预览
+
+三栏布局：左侧会话列表，中间对话主区（Markdown 渲染 + `[资料N]` 引用角标 + 资料卡片），右侧"执行日志"实时面板。执行日志把 Agent 的每一次决策与检索完整展开：模型先决定"要不要查"，再对「RAG 召回」「多 Agent 协作」分别调用本地检索，回答末尾带 `[资料N]` 引用角标。
 
 ***
 
@@ -41,7 +39,7 @@
 
 传统（naive）RAG 的链路是写死的：**任何问题进来都先向量化、检索、把结果塞进 prompt**。这在真实使用中会暴露两个问题：问"写个快排"也要白等一次向量检索；问"今天 AI 圈有什么新闻"时本地库根本没有答案。
 
-本项目把检索从"固定前置步骤"改造成两个 Agent 工具（`kb_search` / `web_search`），由模型根据问题自行决策：
+Roma 智能助手把检索从"固定前置步骤"改造成两个 Agent 工具（`kb_search` / `web_search`），由模型根据问题自行决策：
 
 1. **命中本地知识** → 调 `kb_search`，基于检索结果作答并标注 `[资料N]` 引用；
 2. **通用稳定知识 / 无关问题** → 直接回答，不产生无效检索，且禁止编造引用编号；
@@ -52,17 +50,16 @@
 
 ## 技术栈
 
-| 分类        | 选型                                  | 选型理由                                             |
+| 分类      | 选型                                  | 选型理由                                             |
 | --------- | ----------------------------------- | ------------------------------------------------ |
-| Web 框架    | FastAPI + Uvicorn                   | 原生异步，SSE 流式支持简单；自带 `/docs` 接口文档                  |
-| 大模型       | 阿里云百炼 `qwen3.7-plus`（默认）        | OpenAI 兼容接口 + function calling；原生支持图文输入（复用多模态）；切厂商只改环境变量 |
+| Web 框架  | FastAPI + Uvicorn                   | 原生异步，SSE 流式支持简单；自带 `/docs` 接口文档                  |
+| 大模型     | 阿里云百炼 `qwen3.7-plus`（默认）        | OpenAI 兼容接口 + function calling；原生支持图文输入，截图问答复用同一模型与端点；切厂商只改环境变量 |
 | Embedding | `BAAI/bge-small-zh-v1.5`（本地）        | sentence-transformers 加载，中文效果好、免费、数据不出本机         |
-| 向量库       | Chroma（本地持久化）                       | pip 安装即用，零运维，数据落盘 `data/chroma/`                 |
-| 联网搜索      | Tavily                              | 返回清洗后的正文，专为 Agent 设计；通过适配器接口与 LLM 厂商解耦           |
-| 文档解析      | BeautifulSoup（HTML）+ 原生读取（TXT/MD）   | 覆盖常见知识文件格式                                       |
-| 多模态解析     | qwen3.7-plus 复用（独立端点可配）            | 截图问答前置；VisionParser 适配器按场景指令图→文，输出纯文本再进 RAG          |
-| 前端        | 原生 HTML/CSS/JS + marked + DOMPurify | 无需 Node 构建，FastAPI 直接托管；Markdown 渲染 + XSS 消毒     |
-| 实时通信      | SSE（Server-Sent Events）             | 回答逐 token 推送，检索状态与 Agent 决策过程实时可见                |
+| 向量库     | Chroma（本地持久化）                       | pip 安装即用，零运维，数据落盘 `data/chroma/`                 |
+| 联网搜索    | Tavily                              | 返回清洗后的正文，专为 Agent 设计；通过适配器接口与 LLM 厂商解耦           |
+| 文档解析    | BeautifulSoup（HTML）+ 原生读取（TXT/MD）   | 覆盖常见知识文件格式                                       |
+| 前端      | 原生 HTML/CSS/JS + marked + DOMPurify | 无需 Node 构建，FastAPI 直接托管；Markdown 渲染 + XSS 消毒     |
+| 实时通信    | SSE（Server-Sent Events）             | 回答逐 token 推送，检索状态与 Agent 决策过程实时可见                |
 
 ## 系统架构
 
@@ -100,51 +97,11 @@ flowchart LR
 
 代码被刻意分成四层，依赖方向**只向下**：上层只依赖下层的抽象/契约，绝不 import 具体厂商或引擎实现。`config.py` 作为横向配置层，通过环境变量/`.env` 注入，不参与纵向依赖。
 
-```mermaid
-flowchart TB
-    subgraph api["① 接口层 · app/api"]
-        R["routes：chat(SSE) / sessions / documents"]
-    end
-
-    subgraph agent["② 编排层 · app/agent（业务核心）"]
-        LOOP["loop.py · ReAct 循环 + 三道刹车"]
-        TOOLS["tools/ · 工具注册表（schema + 执行器）"]
-        PROMPT["prompts.py · 提示词 + 日期注入"]
-    end
-
-    subgraph core["③ 基础设施抽象层 · app/core"]
-        LLM["llm.py · 流式 tool_calls 拼装"]
-        VS["embeddings.py / vectorstore.py"]
-        CON["contracts.py · 跨层契约（SessionMemory 等 dataclass）"]
-    end
-
-    subgraph svc["④ 业务服务层 · app/services"]
-        RAG["rag.py · KB 检索（委托 pipeline）"]
-        RET["retrieval/ · 检索管线：dense / sparse(bm25) / rerank / pipeline"]
-        SCH["search/ · 搜索引擎 provider 工厂"]
-        MEM["memory.py · 会话记忆"]
-        VISION["vision.py · 多模态图→文解析（场景注册表）"]
-    end
-
-    R --> LOOP
-    LOOP -->|"只依赖抽象，不感知厂商/分片"| LLM
-    LOOP -->|"查注册表，加工具不改循环"| TOOLS
-    LOOP --> PROMPT
-    TOOLS -->|"kb_search：不感知向量库细节"| RAG
-    TOOLS -->|"web_search：不感知具体引擎"| SCH
-    RAG --> VS
-    LOOP --> MEM
-    R -->|"截图入口：校验后转发"| VISION
-    VISION -->|"纯文本问题"| LOOP
-```
-
-四层职责与「不感知」边界：
-
-| 层          | 职责                      | 换掉它时不动别处                                     |
-| ---------- | ----------------------- | -------------------------------------------- |
-| `api`      | 路由 + SSE 流              | —                                            |
-| `agent`    | ReAct 循环、提示词、工具契约       | 新增工具只加 schema + 执行器，改 `tools/__init__.py` 注册 |
-| `core`     | LLM / embedding / 向量库抽象 | 换模型改 `.env`；流式分片拼装收口在 `llm.py`               |
+| 层       | 职责                      | 换掉它时不动别处                                     |
+| -------- | ----------------------- | -------------------------------------------- |
+| `api`    | 路由 + SSE 流              | —                                            |
+| `agent`  | ReAct 循环、提示词、工具契约       | 新增工具只加 schema + 执行器，改 `tools/__init__.py` 注册 |
+| `core`   | LLM / embedding / 向量库抽象 | 换模型改 `.env`；流式分片拼装收口在 `llm.py`               |
 | `services` | 检索、搜索、记忆、入库、多模态图→文     | 换引擎改 `services/search`；换向量库改 `rag.py`；换视觉模型改 `VISION_*` |
 
 ### 单轮问答的决策流程
@@ -166,7 +123,8 @@ flowchart TD
     LIMIT["工具轮数达上限 → 收回全部工具<br/>强制模型基于已有信息收尾"] -.-> CALL
 ```
 
-### 一次问答中的 SSE 事件序列
+<details>
+<summary>展开：一次问答中的 SSE 事件序列</summary>
 
 前端所有渲染（包括执行日志）都由这组事件驱动，后端不保存任何 UI 状态：
 
@@ -186,10 +144,12 @@ error               出错信息（格式非法 / 未配模型 / 解析为空 �
 done                本轮结束
 ```
 
+</details>
+
 ## 项目结构
 
 ```
-QA-assistant/
+roma-assistant/
 ├── app/
 │   ├── main.py                  # FastAPI 入口；lifespan 中自动增量建库
 │   ├── config.py                # 全部可调参数（pydantic-settings 读环境变量/.env）
@@ -263,7 +223,7 @@ uvicorn app.main:app --reload
 
 - 聊天界面：<http://127.0.0.1:8000>
 
-首次启动需要完成两件事：从 HuggingFace 镜像下载 bge 模型（默认走 `hf-mirror.com`），以及把 `data/faqs.json` 中的 1293 道问题向量化入库，预计等待 1～3 分钟（取决于机器）。后续启动通过签名清单做增量同步，未变化的内容直接跳过，秒级完成。
+首次启动需要完成两件事：从 HuggingFace 镜像下载 bge 模型（默认走 `hf-mirror.com`），以及把 `data/faqs.json` 中的题库向量化入库，预计等待 1～3 分钟（取决于机器）。后续启动通过签名清单做增量同步，未变化的内容直接跳过，秒级完成。
 
 开箱后即可直接提问，例如：
 
@@ -275,36 +235,19 @@ uvicorn app.main:app --reload
 
 ## 配置说明
 
-所有参数均通过环境变量或 `.env` 注入，集中定义在 [app/config.py](app/config.py)：
+全部参数集中定义在 [app/config.py](app/config.py)，并通过环境变量或 `.env` 注入。下表只列最常用的几项，**完整清单（含每项默认值与说明）见 [.env.example](.env.example)**：
 
-| 参数                      | 默认值                                                            | 说明                                                   |
-| ----------------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
-| `LLM_API_KEY`           | 无（**必填**）                                                      | 大模型 API 密钥                                           |
-| `LLM_BASE_URL`          | `https://dashscope.aliyuncs.com/compatible-mode/v1`           | OpenAI 兼容接口地址，换厂商只改这里                                |
-| `LLM_MODEL`             | `qwen3.7-plus`                                                 | 模型名（默认阿里云百炼 qwen3.7-plus；换 deepseek-chat 则同时改上面两项） |
-| `VISION_MODEL`          | `qwen3.7-plus`                                                 | 多模态图→文模型 ID；留空则禁用截图问答（硬失败，不静默降级）                    |
-| `VISION_BASE_URL`       | 复用 `LLM_BASE_URL`（留空即复用）                                   | 视觉模型的兼容端点；换不同厂商的视觉模型时单独配                         |
-| `VISION_API_KEY`        | 复用 `LLM_API_KEY`（留空即复用）                                    | 视觉模型的 API Key；同上                                      |
-| `MAX_IMAGE_BYTES`       | `5242880`（5 MB）                                                 | 单张图片 dataURL 字符数上限（前端已压缩，后端双保险）                        |
-| `TAVILY_API_KEY`        | 无（选填）                                                          | 不填不影响启动，触发联网时降级为直答                                   |
-| `SEARCH_PROVIDER`       | `tavily`                                                       | 搜索引擎，新增引擎在 `services/search/` 注册适配器                  |
-| `SEARCH_MAX_RESULTS`    | `5`                                                            | 每次搜索返回的网页数                                           |
-| `SEARCH_DEPTH`          | `advanced`                                                     | `basic`=1 credit/次；`advanced`=2 credits，正文更全、可减少二次搜索 |
-| `SEARCH_COUNTRY`        | `china`                                                        | 搜索地域限定，留空则不限制                                        |
-| `SEARCH_MAX_ROUNDS`     | `3`                                                            | 单轮问答最多 **kb+web 所有工具调用**轮数（防失控、控延迟）                 |
-| `MAX_CONSECUTIVE_EMPTY` | `2`                                                            | 连续几次检索为空/失败即熔断，提前收回工具                                |
-| `WEB_SEARCH_DEFAULT`    | `true`                                                         | 前端"联网"开关的默认值                                         |
-| `EMBEDDING_MODEL`       | `BAAI/bge-small-zh-v1.5`                                       | 本地 embedding 模型                                      |
-| `HF_ENDPOINT`           | `https://hf-mirror.com`                                        | HuggingFace 镜像；能直连官方时可改为官方地址                         |
-| `CHUNK_SIZE`            | `512`                                                          | 文本切片最大字符数                                            |
-| `CHUNK_OVERLAP`         | `64`                                                           | 相邻切片重叠字符数                                            |
-| `TOP_K`                 | `4`                                                            | 每次检索最终返回的片段数                                           |
-| `RETRIEVAL_MODE`        | `dense`                                                        | `dense`=纯向量单路（默认，评测最强）；`hybrid`=稠密 + BM25 稀疏扩池（配合重排才有意义） |
-| `RETRIEVAL_CANDIDATE_K` | `20`                                                           | 每路召回候选数（融合后候选池大小，重排覆盖全池）                      |
-| `RERANK_ENABLED`        | `false`                                                        | 是否启用 Cross-Encoder 重排；默认关闭（本语料实测负收益），模型缺失/加载失败自动降级为不重排 |
-| `RERANK_MODEL`          | `BAAI/bge-reranker-v2-m3`                                      | 重排模型；需本地下载（HF 镜像），CPU 上延迟较高                       |
-| `MEMORY_WINDOW_TOKENS`  | `20000`                                                        | 近轮原文估算 token 超此值触发滚动压缩                               |
-| `MEMORY_TARGET_TOKENS`  | `10000`                                                        | 压缩后原文回落到的目标值                                         |
+| 参数                  | 默认值                         | 说明                                    |
+| ------------------- | --------------------------- | ------------------------------------- |
+| `LLM_API_KEY`       | 无（**必填**）                   | 大模型 API 密钥                            |
+| `LLM_BASE_URL`      | 阿里云百炼兼容端点                   | OpenAI 兼容接口地址，换厂商只改这里                  |
+| `LLM_MODEL`         | `qwen3.7-plus`              | 模型名（换 deepseek-chat 则同时改上面两项）          |
+| `VISION_MODEL`      | `qwen3.7-plus`              | 多模态图→文模型；留空则禁用截图问答（硬失败，不静默降级）        |
+| `TAVILY_API_KEY`    | 无（选填）                       | 不填不影响启动，触发联网时降级为直答                    |
+| `WEB_SEARCH_DEFAULT` | `true`                      | 前端"联网"开关的默认值                           |
+| `TOP_K`             | `4`                         | 每次检索最终返回的片段数                           |
+| `RETRIEVAL_MODE`    | `dense`                     | `dense`=纯向量单路（默认，评测最强）；`hybrid`=稠密 + BM25 稀疏扩池 |
+| `RERANK_ENABLED`    | `false`                     | 是否启用 Cross-Encoder 重排；默认关闭（本语料实测负收益）      |
 
 ## 数据集与自定义知识
 
@@ -344,11 +287,9 @@ uvicorn app.main:app --reload
 
 流式协议下，一次工具调用的 `id / 函数名 / arguments JSON` 是按分片增量到达的（arguments 甚至可能半个字符一切）。[app/core/llm.py](app/core/llm.py) 按 `index` 累加 arguments 拼装出完整调用结构，对上层屏蔽分片细节；并以"是否真的收到过分片"而非 `finish_reason` 判定工具调用——不同厂商兼容层的 finish\_reason 并不总是规范。
 
-### 3. 双 Collection 合并检索
+### 3. 双 Collection 检索与检索管线
 
 Chroma 中维护两张表（[vectorstore.py](app/core/vectorstore.py)）：`docs` 存长文档切片（一篇多片），`faq` 存一问一答。两表都用 cosine 空间，分数天然可比：检索时各取 `top_k×2` 候选，**跨表按相似度全局排序**后返回 top\_k，结果带 `collection` 字段供前端区分渲染。
-
-### 3.1 检索管线：dense + BM25 扩池 + Cross-Encoder 重排
 
 检索细节收口在 [app/services/retrieval/](app/services/retrieval/)，`rag.py` 只调 `pipeline.retrieve()`。管线形态是标准的 retrieve-then-rerank：
 
@@ -356,9 +297,7 @@ Chroma 中维护两张表（[vectorstore.py](app/core/vectorstore.py)）：`docs
 2. **稀疏扩池**（`sparse.py`）：BM25（`rank_bm25` + jieba 中文分词）再取 `candidate_k` 个，**只把稠密没召回到的候选补进池子，不改变已有候选的稠密排序**。为什么不用 RRF 融合？实测等权 RRF 会把"BM25 第 18 + 稠密第 11"的噪声候选叠加分顶到稠密第 1 名之上，L4 从 84% 掉到 71%。本项目稠密远强于稀疏，因此稀疏定位是"扩大召回面"而非"参与排序"；
 3. **Cross-Encoder 重排**（`rerank.py`）：对整个候选池（不截前缀）精排，取 top\_k。sigmoid(logit) 归一到 0~1。
 
-降级是硬性保证：BM25 依赖缺失/构建失败 → 只用稠密；重排模型缺失/加载失败 → 记 warning 跳过重排、回退稠密序。**任何一步失败最差等于改造前行为，绝不比 dense 基线更差**。`retrieval_mode` / `rerank_enabled` 两个开关可随时退档。
-
-启动时 `build_sparse_index()` 预热 BM25（从 `vectorstore.iter_all()` 拿全量条目）。
+降级是硬性保证：BM25 依赖缺失/构建失败 → 只用稠密；重排模型缺失/加载失败 → 记 warning 跳过重排、回退稠密序。**任何一步失败最差等于改造前行为，绝不比 dense 基线更差**。`retrieval_mode` / `rerank_enabled` 两个开关可随时退档。启动时 `build_sparse_index()` 预热 BM25（从 `vectorstore.iter_all()` 拿全量条目）。
 
 ### 4. 增量索引：为什么重启很快
 
@@ -397,9 +336,8 @@ data/sessions/<session_id>/
 用户上传截图后**不**直接把 base64 图片塞进 Agent 的工具循环（那会破坏 token 估算与滚动压缩，也让 Agent 编排层感知图片来源），而是走前置的"图 → 文"适配器：
 
 1. **VisionParser 按选定场景把图片流式解析成纯文本**（[services/vision.py](app/services/vision.py)），输出逐段 yield，路由层一边收一边透传 `vision_token` 事件；
-2. **解析完成后把文本 + 场景追问句拼成 `rag_question`**，再作为普通问题进入下面的 Agent 工具循环——`loop.py`、`prompts.py`、`tools/` 的全部逻辑完全不感知"这题之前是图片"。
-
-#### 场景注册表：单一事实源
+2. **解析完成后把文本 + 场景追问句拼成 `rag_question`**，再作为普通问题进入 Agent 工具循环——`loop.py`、`prompts.py`、`tools/` 的全部逻辑完全不感知"这题之前是图片"；
+3. **图片不进 LLM 工作窗口**：归档里存的是解析后的纯文本 + 场景追问句，原始图片只在 `append(..., images=[...])` 中归档供历史展示，绝不进入 `messages.jsonl`，保证 token 估算、滚动摘要与上下文窗口都是纯文本。
 
 每个场景（当前有控制台报错 / 布局错位 / 设计稿对比三种）是一条 `SceneSpec`：
 
@@ -414,15 +352,7 @@ class SceneSpec:
 
 旧版是三份平行 `Dict[str, str]`（key 必须处处一致，加一个场景要改三处）；合并为 `SceneSpec` 后，新增/修改/删除场景只有 `SCENES` 表一处，**单一事实源**。
 
-#### 为什么视觉解析是硬失败，不降级？
-
-检索/联网失败遵循"降级哲学"（错误文本回灌给模型，模型基于自身知识收尾并声明未能联网核实）。但视觉解析是本项目中**唯一刻意走硬失败**的环节——没配视觉模型、场景不在注册表、图片格式非法、解析返回空内容，任何一种都直接发 `error` 事件让用户重试，**不静默降级**。
-
-原因是：图片没有"降级成文字"的自然路径。让 VisionParser 自己抛异常（`RuntimeError` 表示未配模型、`ValueError` 表示未知场景），路由层分别转成有针对性的错误消息，比"悄悄跳过图片只按补充说明回答"更诚实。
-
-#### 图片不进 LLM 工作窗口
-
-视觉解析完成后，用户消息存进 `archive.jsonl` 的是**解析出的纯文本 + 场景追问句**，原始图片只在 `append(..., images=[...])` 中归档供历史展示，**绝不**进入 `messages.jsonl`（LLM 工作窗口）。这保证 token 估算、滚动摘要压缩、Agent 工具循环的上下文窗口都是纯文本，不会因为用户多传一张图就把几百 KB 的 base64 塞进 prompt。
+**为什么视觉解析是硬失败，不降级？** 检索/联网失败遵循"降级哲学"（错误文本回灌给模型，模型基于自身知识收尾并声明未能联网核实）。但视觉解析是本项目中**唯一刻意走硬失败**的环节——没配视觉模型、场景不在注册表、图片格式非法、解析返回空内容，任何一种都直接发 `error` 事件让用户重试，**不静默降级**。原因是：图片没有"降级成文字"的自然路径，让 VisionParser 自己抛异常（`RuntimeError` 表示未配模型、`ValueError` 表示未知场景）比"悄悄跳过图片只按补充说明回答"更诚实。
 
 ### 8. 可观测：把 Agent 的"思考过程"做成产品
 
@@ -445,7 +375,7 @@ class SceneSpec:
 初版用「题库原题直接检索自己」的方式测，Recall 天然 ≈100%，分数看似漂亮却**说明不了检索质量**。重构后（`run_retrieval_v2.py` + `build_retrieval_set.py`）做了两处关键设计：
 
 1. **难度分级，而非单一指标**：同一道 gold 题构造四种问法——L1 同义改写（软）、L2 口语化（贴近线上分布）、L3 难负例（对改写句挖向量近邻干扰）、L4 激进改写（措辞/句式/语序尽量拉开、考点不变，逼 embedding 漂移）。
-2. **排序敏感指标 + 下界基线**：用 `nDCG@K`、`Recall@1`、单选选对率（gold 与负例在候选池里硬碰硬）替代只看「id 命中」的 Recall；并用随机检索的闭式解做下界，看真实系统相对随机能拉开多少。
+2. **排序敏感指标 + 下界基线**：用 `nDCG@K`、`Recall@1`、单选选对率（gold 与负例在候选池里硬碰硬，随机猜中概率 = 1/6 ≈ 16.67%）替代只看「id 命中」的 Recall；并用随机检索的闭式解做下界，看真实系统相对随机能拉开多少。
 
 实测（200 题、seed=42、top_k=4）：
 
@@ -466,9 +396,7 @@ python -m app.eval.run_retrieval_v2 --top-k 4              # 评测（无需 LLM
 
 ### 检索管线演进：dense → hybrid → hybrid+rerank
 
-为了验证"稠密 + 稀疏补池 + Cross-Encoder 重排"是否真的比纯稠密更好，用同一套评测集跑了三档对照（`run_retrieval_v2 --pipeline {dense,hybrid,hybrid_rerank}`）。**关键设计决策：稀疏一路只扩候选池、不改变排序，最终顺序交给重排器**——实测过等权 RRF 会把"双路都命中"的噪声候选加权顶到稠密第 1 名之上，L4 反而从 84% 掉到 71%，因此废弃了 RRF。
-
-L4（激进改写）Recall@1 对照：
+为了验证"稠密 + 稀疏补池 + Cross-Encoder 重排"是否真的比纯稠密更好，用同一套评测集跑了三档对照（`run_retrieval_v2 --pipeline {dense,hybrid,hybrid_rerank}`）。关键结论：**稀疏一路只扩候选池、不改变排序**（等权 RRF 会把"双路都命中"的噪声候选加权顶到稠密第 1 名之上，L4 从 84% 掉到 71%，因此废弃 RRF）。
 
 | 管线 | L4 Recall@1 | 说明 |
 | --- | --- | --- |
@@ -477,8 +405,9 @@ L4（激进改写）Recall@1 对照：
 | hybrid + rerank（`bge-reranker-base`，candidate_k=20） | 80.50% | 轻量重排器弱于本项目稠密向量，**-3.5pp** |
 
 诚实结论与最终决策：
+
 - **默认关闭重排、默认走 pure dense**：证据明确——base 重排器负收益（-3.5pp），更强的 `v2-m3` 在 CPU 上又不可接受（载入即冻结），因此当前没有"重排能带来收益"的实测依据，不把未验证且更慢的路径设为默认；
-- **hybrid union 仍保留为可开关能力**：它对长文档 / 生僻词 / 跨语言等稠密弱项场景能扩大召回面。"稠密 + BM25 扩池 + 重排"三条形态都保留在 `services/retrieval/` 里，通过 `RETRIEVAL_MODE` / `RERANK_ENABLED` 随时切换；
+- **hybrid union 仍保留为可开关能力**：它对长文档 / 生僻词 / 跨语言等稠密弱项场景能扩大召回面，通过 `RETRIEVAL_MODE` / `RERANK_ENABLED` 随时切换；
 - 重排关闭时 `hybrid` 与 `dense` 对 top_k 结果等价（稀疏扩池的候选余弦分永远进不了 top-4），因此默认 `dense` 避免无谓的 BM25 构建与查询开销；
 - 未来若上 GPU、或换更强的多语言重排器，可用已有评测框架（`--pipeline hybrid_rerank`）重新验证，届时再决定是否启用。
 
@@ -500,8 +429,7 @@ L4（激进改写）Recall@1 对照：
 
 - **单机单用户设计**：无鉴权、无多租户；会话基于本地文件存储，多 worker/多用户场景需升级为 SQLite/PostgreSQL（上层服务接口已隔离）。
 - **运行期热加载**：知识文件在启动时扫描入库，运行中新增文件需要重启（增量同步成本低，但未做 watcher）。
-- **重排默认关闭（待强模型验证）**：已实现 dense + BM25 扩池 + Cross-Encoder 重排的完整管线（`services/retrieval/`），但评测显示轻量 `bge-reranker-base` 对本 FAQ 语料弱于纯稠密（L4 84%→80.5%），更强的 `bge-reranker-v2-m3` 在 CPU 上不可接受，故默认 `RERANK_ENABLED=false`。若上 GPU / 换更强调单器可重新评测后启用。
+- **重排默认关闭（待强模型验证）**：完整管线（dense + BM25 扩池 + Cross-Encoder 重排）已实现，但评测显示轻量 `bge-reranker-base` 弱于纯稠密、更强的 `bge-reranker-v2-m3` 在 CPU 上不可接受，故默认 `RERANK_ENABLED=false`；上 GPU / 换更强重排器后可重新评测启用（详见[检索管线演进](#检索管线演进dense--hybrid--hybridrerank)）。
 - **模型需支持 OpenAI 标准 function calling**；极小众兼容层可能存在流式协议差异（代码已对 finish\_reason 不规范做兜底）。
 - **多模态限制**：截图问答仅接受 dataURL（不支持远程 URL 或本地路径）；图片只在当前这一次"截图→解析→回答"链路中使用，跨轮不带图片；无 OCR 兜底（完全依赖视觉模型的中文理解能力）。
 - **运行时扫描根目录**：`data/` 同时作为知识文件目录与爬虫缓存目录，当前只靠后缀白名单区分，未来缓存目录迁移或加入显式排除后更干净。
-

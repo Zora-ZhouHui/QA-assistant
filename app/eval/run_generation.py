@@ -28,7 +28,7 @@ from app.eval.dataset import sample_faqs
 from app.eval.judge import call_llm, judge_faithfulness, judge_relevancy_questions
 from app.eval.metrics import answer_relevancy, cosine_similarity, faithfulness, mean
 
-_GENERATION_PROMPT = """你是知识问答助手。请只根据下面提供的「资料」回答问题，不要使用资料之外的知识。回答要简洁准确；凡是用到某条资料支撑结论的句子，句末标注来源编号，格式 [资料N]，多个用逗号分隔。引用编号必须真实存在；资料不足以回答时如实说明，不要编造。
+_GENERATION_PROMPT = """你是 Roma 智能助手。请只根据下面提供的「资料」回答问题，不要使用资料之外的知识。回答要简洁准确；凡是用到某条资料支撑结论的句子，句末标注来源编号，格式 [资料N]，多个用逗号分隔。引用编号必须真实存在；资料不足以回答时如实说明，不要编造。
 
 <资料>
 {context}

@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="知识问答助手", lifespan=lifespan)
+app = FastAPI(title="Roma 智能助手", lifespan=lifespan)
 
 app.include_router(routes_chat.router)
 app.include_router(routes_docs.router)

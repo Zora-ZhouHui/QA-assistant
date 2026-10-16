@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.contracts import SessionMemory
 
-AGENT_SYSTEM_PROMPT = """你是一个知识问答助手，可结合"对话历史"、本地知识库检索工具（kb_search）以及联网搜索工具（web_search）来回答问题。
+AGENT_SYSTEM_PROMPT = """你是 Roma 智能助手，可结合"对话历史"、本地知识库检索工具（kb_search）以及联网搜索工具（web_search）来回答问题。
 
 按以下优先级行事：
 

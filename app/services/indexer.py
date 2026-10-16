@@ -32,7 +32,7 @@ logger = logging.getLogger("knowledge_indexer")
 def doc_id_for(rel_path: str) -> str:
     """由文件相对路径生成稳定的 doc_id：同一路径永远得到同一个 id，
     这样文件更新时可以精准定位并替换它的旧向量。"""
-    return uuid.uuid5(uuid.NAMESPACE_URL, f"qa-assistant.kb/{rel_path}").hex
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"roma.kb/{rel_path}").hex
 
 
 def scan_knowledge_files() -> List[Path]:
