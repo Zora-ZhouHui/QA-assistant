@@ -357,16 +357,33 @@ function logLlmStart(callNo) {
   llmStep = { el: step };
 }
 
-// 该次模型调用以"请求调用工具"告终 → 定型为决策步骤
-function logLlmDecision() {
+// 定型当前"模型调用"节点：一次调用是"决策"还是"生成"，只在它**结束后**由后续
+// 事件决定——调用工具 → 决策；不调工具、只产出正文 → 生成。所以不能一见正文
+// token 就定型：模型可能先输出一段正文再发起工具调用（该次调用的本质仍是决策），
+// 若在正文处就把节点定型并置空 llmStep，后续 kb_searching 到达时会因 llmStep 为
+// null 而漏记决策，且把"回答"节点错误地插到检索之前。
+//   kind='decision'  ：本次调用以调用工具告终（决策次数 +1）
+//   kind='generation'：本次调用产出最终回答（就地定型为"回答"节点并启动计时）
+function finalizeLlmStep(kind, basis) {
   if (!llmStep) return;
   const { el } = llmStep;
-  decisionCalls += 1;
   el.classList.remove('running');
   el.classList.add('info');
   el.querySelector('.log-node').classList.remove('spin');
-  el.querySelector('.log-action').textContent = `第 ${llmCalls} 次调用 · 决策：调用工具`;
+  if (kind === 'decision') {
+    decisionCalls += 1;
+    el.querySelector('.log-action').textContent = `第 ${llmCalls} 次调用 · 决策：调用工具`;
+  } else {
+    el.innerHTML =
+      '<span class="log-node"></span>' +
+      '<div class="log-head"><span class="log-kind answer">回答</span>' +
+      '<span class="log-action">开始生成回答</span>' +
+      `<span class="log-time">${nowTime()}</span></div>` +
+      `<div class="log-detail">${escapeHtml(basis || '')}</div>`;
+    answerStep = { el, start: performance.now() };
+  }
   llmStep = null;
+  logListEl.scrollTop = logListEl.scrollHeight;
 }
 
 function logToolStart(kind, query) {
@@ -491,6 +508,38 @@ function logAnswerDone() {
     step.innerHTML = `<span class="log-node"></span><div class="log-meta">本轮总耗时 ${total}s${summary ? ' · ' + summary : ''}</div>`;
   }
   logListEl.scrollTop = logListEl.scrollHeight;
+}
+
+// 流结束（done / 出错 / 请求中断）时兜底收尾：把仍在"进行中"的步骤停表，避免
+// 最后一个节点（典型为末次生成调用的"模型 · 推理中"）永远停留在转圈态。
+// 末尾再扫一遍 DOM，任何遗漏的 running 步骤一律停表，保证结束时无节点转圈。
+function finalizeRunningSteps() {
+  const stopSpin = (el, state) => {
+    if (!el) return;
+    el.classList.remove('running');
+    el.classList.add(state);
+    const node = el.querySelector('.log-node');
+    if (node) node.classList.remove('spin');
+  };
+  if (visionStep) {
+    stopSpin(visionStep.el, 'ok');
+    const action = visionStep.el.querySelector('.log-action');
+    if (action) action.textContent = '图片解析完成';
+    visionStep = null;
+  }
+  if (activeToolStep) {
+    const meta = activeToolStep.el.querySelector('.log-meta');
+    if (meta && meta.textContent === '执行中…') meta.textContent = '已中断';
+    stopSpin(activeToolStep.el, 'info');
+    activeToolStep = null;
+  }
+  if (llmStep) {
+    const action = llmStep.el.querySelector('.log-action');
+    if (action) action.textContent = `第 ${llmCalls} 次调用 · 生成回答`;
+    stopSpin(llmStep.el, 'info');
+    llmStep = null;
+  }
+  logListEl.querySelectorAll('.log-step.running').forEach(el => stopSpin(el, 'info'));
 }
 
 function logError(message) {
@@ -959,6 +1008,10 @@ async function sendQuestion(scene) {
   let sourcesBlock = null; // 当前资料面板 DOM（sources/web_sources 到达时整体重渲染）
 
   const removeThinking = () => { if (thinking) { thinking.remove(); thinking = null; } };
+  // "回答"节点的依据说明：按当前已累计的资料数生成
+  const basisText = () => currentSources.length
+    ? `基于 ${currentSources.length} 条检索资料作答`
+    : '未检索资料，基于模型自身知识作答';
 
   try {
     const res = await fetch('/api/chat', {
@@ -999,11 +1052,13 @@ async function sendQuestion(scene) {
           if (thinking) thinking.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span> 思考中';
           logVisionDone();
         } else if (evt.type === 'llm_start') {
+          // 上一次调用若无工具事件收尾，则它必然以生成告终（循环无工具调用即结束）
+          finalizeLlmStep('generation', basisText());
           // 右侧日志：模型第 N 次调用开始（是决策还是生成，由后续事件定型）
           logLlmStart(evt.call);
         } else if (evt.type === 'kb_searching') {
           // 该次模型调用以调用工具告终 → 定型为决策；右侧日志：本地知识库检索开始
-          logLlmDecision();
+          finalizeLlmStep('decision');
           logToolStart('kb', evt.query);
         } else if (evt.type === 'sources') {
           // 右侧日志：本地检索完成（结果数 + 耗时，可展开看每条标题）
@@ -1015,7 +1070,7 @@ async function sendQuestion(scene) {
           sourcesBlock = showSources(body, currentSources, answerEl);
         } else if (evt.type === 'searching') {
           // 该次模型调用以调用工具告终 → 定型为决策；右侧日志：联网搜索开始
-          logLlmDecision();
+          finalizeLlmStep('decision');
           logToolStart('web', evt.query);
         } else if (evt.type === 'web_sources') {
           // 右侧日志：联网搜索完成
@@ -1031,27 +1086,10 @@ async function sendQuestion(scene) {
         } else if (evt.type === 'token') {
           if (!gotToken) {
             removeThinking();
-            const basis = currentSources.length
-              ? `基于 ${currentSources.length} 条检索资料作答`
-              : '未检索资料，基于模型自身知识作答';
-            if (llmStep) {
-              // 进行中的"模型调用"步骤就地定型为生成回答（本次调用 = 生成）
-              const { el } = llmStep;
-              el.classList.remove('running');
-              el.classList.add('info');
-              el.querySelector('.log-node').classList.remove('spin');
-              el.innerHTML =
-                '<span class="log-node"></span>' +
-                '<div class="log-head"><span class="log-kind answer">回答</span>' +
-                '<span class="log-action">开始生成回答</span>' +
-                `<span class="log-time">${nowTime()}</span></div>` +
-                `<div class="log-detail">${escapeHtml(basis)}</div>`;
-              answerStep = { el, start: performance.now() };
-              llmStep = null;
-            } else {
-              logAnswerStart(basis);
-            }
             gotToken = true;
+            // 无 llm_start 来源（如设计稿对比直答）：正文即最终答案，直接建"回答"节点。
+            // 有 llm_start 时，该次调用是决策还是生成要等结果事件，故此处不动模型节点。
+            if (!llmStep) logAnswerStart(basisText());
           }
           fullText += evt.content;
           // 每个 token 后重渲染 Markdown + 引用角标（文本量小，性能无压力）
@@ -1064,6 +1102,8 @@ async function sendQuestion(scene) {
           errEl.textContent = '[错误] ' + evt.message;
           answerEl.appendChild(errEl);
         } else if (evt.type === 'done') {
+          // 末次调用（生成）在 done 前没有后续事件可定型，这里收尾为"回答"节点
+          finalizeLlmStep('generation', basisText());
           removeThinking();
           logAnswerDone();
           // 最终完整渲染一次，保证闭合状态正确
@@ -1082,6 +1122,7 @@ async function sendQuestion(scene) {
     errEl.textContent = '请求失败：' + e.message;
     answerEl.appendChild(errEl);
   } finally {
+    finalizeRunningSteps();  // 兜底：流结束（含中断）后不再有节点停留转圈态
     sendBtn.disabled = false;
     liveStreaming = false;
   }
