@@ -1,5 +1,7 @@
 """全局配置：从环境变量 / .env 文件读取，所有可调参数集中在这里。"""
+import json
 from pathlib import Path
+from typing import Dict
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,6 +32,17 @@ class Settings(BaseSettings):
 
     # 单张图尺寸上限（前端已压缩，这里是双保险；按 dataURL 字符数计）
     max_image_bytes: int = 5 * 1024 * 1024
+
+    # 模型单价表：JSON 字符串，格式 {"模型ID": {"input": 输入价, "output": 输出价}}，
+    # 单位为 人民币元 / 1M tokens。接口不返回单价，须按厂商定价页自行维护；
+    # 留空或缺某个模型时，该模型只统计 token 数、不显示成本（绝不捏造价格）。
+    # 示例（数值以百炼定价页为准）：MODEL_PRICES={"qwen3.7-plus": {"input": 0.8, "output": 2.0}}
+    model_prices: str = ""
+
+    # 图片解析缓存：同图 + 同场景 + 同补充说明命中时直接返回缓存文本，
+    # 跳过视觉模型调用（实测每张截图输入侧约数百至上千 tokens，命中即全省）。
+    # 图片内容本身参与哈希，改图即换 key，不会返回旧图结果。
+    vision_cache_enabled: bool = True
 
     # 本地 embedding 模型（首次运行时自动下载）
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
@@ -83,6 +96,17 @@ class Settings(BaseSettings):
     d2l_base_url: str = "https://zh.d2l.ai"
 
     @property
+    def price_map(self) -> Dict[str, Dict[str, float]]:
+        # 解析 MODEL_PRICES；非法 JSON / 非对象一律视为未配置（不阻断启动）
+        if not self.model_prices:
+            return {}
+        try:
+            data = json.loads(self.model_prices)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @property
     def chroma_dir(self) -> Path:
         # Chroma 向量库持久化目录（重启后知识库仍在）
         return self.data_dir / "chroma"
@@ -123,6 +147,11 @@ class Settings(BaseSettings):
     def embedding_input_file(self) -> Path:
         # "分块之后、进入 embedding 模型之前"的数据快照（人工核对数据质量用）
         return self.data_dir / "embedding_input.json"
+
+    @property
+    def vision_cache_dir(self) -> Path:
+        # 图片解析结果缓存目录（sha256 key → 解析文本）
+        return self.data_dir / "vision_cache"
 
 
 settings = Settings()

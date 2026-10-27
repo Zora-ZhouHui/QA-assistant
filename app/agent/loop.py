@@ -28,6 +28,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.agent.prompts import build_system_messages
 from app.agent.tools import TOOL_EXECUTORS, get_tools
+from app.agent.tools.vision_lookup import find_session_images, make_executor
 from app.config import settings
 from app.core.contracts import SessionMemory
 from app.core.llm import get_llm_client
@@ -57,23 +58,41 @@ class AgentService:
         question: str,
         memory: Optional[SessionMemory] = None,
         web_search_enabled: bool = True,
+        session_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """运行一轮问答，产出与 SSE 对应的事件流：
           {"type": "token", "content": str}            —— 回答文本增量
           {"type": "kb_searching", "query": str}       —— 正在检索本地知识库
           {"type": "searching", "query": str}          —— 正在联网搜索
+          {"type": "vision_lookup", "query": str}      —— 正在重看本会话此前的截图
+          {"type": "vision_lookup_done", ...}          —— 重看完成（提取字符数）
           {"type": "sources", "documents": [...]}      —— KB 检索资料（编号已分配）
           {"type": "web_sources", "documents": [...]}  —— 网页资料（编号接续 KB 之后）
           {"type": "search_failed", ...}               —— 检索失败/空结果
+          {"type": "usage", "usage": {...}, "llm_calls": n} —— 收尾时产出本轮 token 用量汇总
         """
         # question 是纯文本：文字问答为用户原问题，截图问答为多模态解析结果，
         # 两者在此完全等价——本循环只认文字，不感知图片来源（见 routes_chat.py）。
-        messages = build_system_messages(question, memory)
+        #
+        # vision_lookup 是"会话态"工具：依赖 session_id 找本会话此前的截图，
+        # 仅当会话确实存在过截图时才注入 schema 与执行器，避免空会话无谓暴露工具。
+        executors = TOOL_EXECUTORS
+        include_vision_lookup = False
+        if session_id:
+            if find_session_images(session_id):
+                include_vision_lookup = True
+                executors = {**TOOL_EXECUTORS, "vision_lookup": make_executor(session_id)}
+
+        messages = build_system_messages(
+            question, memory, has_session_images=include_vision_lookup
+        )
         llm = get_llm_client()
 
         next_index = 1  # 全局编号计数器：KB 与网页资料共用一套编号，按到达顺序接续
         executed_rounds = 0
         llm_calls = 0   # 模型调用总次数（决策 + 生成）
+        # token 用量汇总：跨多次模型调用（决策 + 生成）累加，收尾时一次性产出
+        usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         # 刹车 a：已执行过的 (工具名, 归一化 query)，重复出现直接拦截
         seen_calls: set = set()
         # 刹车 b：连续空结果/失败计数，命中即熔断；任一次拿到结果立即归零
@@ -92,7 +111,7 @@ class AgentService:
                 executed_rounds < settings.search_max_rounds
                 and not tools_revoked
             ):
-                tools = get_tools(web_search_enabled)
+                tools = get_tools(web_search_enabled, include_vision_lookup=include_vision_lookup)
             else:
                 tools = []
             tool_calls: List[Dict[str, Any]] = []
@@ -110,6 +129,9 @@ class AgentService:
             ):
                 if event["type"] == "token":
                     yield event
+                elif event["type"] == "usage":
+                    for k in usage_total:
+                        usage_total[k] += event["usage"].get(k, 0)
                 else:  # tool_calls
                     tool_calls = event["calls"]
 
@@ -133,7 +155,7 @@ class AgentService:
                 name = func.get("name", "")
                 arguments = func.get("arguments", "{}")
 
-                executor = TOOL_EXECUTORS.get(name)
+                executor = executors.get(name)
                 if executor is None:
                     messages.append(
                         {
@@ -144,7 +166,7 @@ class AgentService:
                     )
                     continue
 
-                # 解析 query（kb_search / web_search 均用 query 参数）
+                # 解析 query（kb_search / web_search / vision_lookup 均用 query 参数）
                 try:
                     query = str(json.loads(arguments or "{}").get("query") or "")
                 except json.JSONDecodeError:
@@ -156,6 +178,8 @@ class AgentService:
                     yield {"type": "kb_searching", "query": query, "round": executed_rounds}
                 elif name == "web_search":
                     yield {"type": "searching", "query": query, "round": executed_rounds}
+                elif name == "vision_lookup":
+                    yield {"type": "vision_lookup", "query": query, "round": executed_rounds}
 
                 # 刹车 a：同工具 + 同归一化关键词、且上次执行拿到过非空结果 →
                 # 不真正执行。向量检索对同一 query 的结果是确定性的，重跑只会
@@ -192,17 +216,39 @@ class AgentService:
 
                 result = await executor(arguments)
 
-                # 分流取结果与格式化器：KB 走 sources 事件，网页走 web_sources 事件
+                # 分流取结果与格式化器：KB 走 sources 事件，网页走 web_sources 事件；
+                # vision_lookup 是文本结果（不占资料编号），成功分支单独处理
                 if name == "kb_search":
                     results = result.get("kb_results") or []
                     event_type = "sources"
                     fmt = _format_kb_block
-                else:  # web_search
+                elif name == "web_search":
                     results = result.get("web_results") or []
                     event_type = "web_sources"
                     fmt = _format_web_block
+                else:  # vision_lookup：结果在 vision_text（成功）或 output（失败说明）
+                    results = []
 
-                if results:
+                vision_text = (result.get("vision_text") or "").strip()
+
+                if vision_text:
+                    # 重看截图成功：文本直接回灌模型，不占用资料编号
+                    consecutive_empty = 0
+                    seen_calls.add(dedup_key)
+                    tool_content = (
+                        "截图重看结果（针对你的追问从图片中定向提取）：\n\n"
+                        + vision_text
+                    )
+                    yield {
+                        "type": "vision_lookup_done",
+                        "query": query,
+                        "chars": len(vision_text),
+                        "round": executed_rounds,
+                        # 重看截图是一次独立的视觉模型调用，usage 随事件带出，
+                        # 由路由层并入 done 汇总（缓存命中时为 None，不计量）
+                        "usage": result.get("usage"),
+                    }
+                elif results:
                     # 拿到有效结果：空结果 streak 归零，并把该词记入去重账本
                     # （失败不记账：瞬时故障后允许原词重试一次）
                     consecutive_empty = 0
@@ -268,13 +314,29 @@ class AgentService:
                         )
 
                 logger.info(
-                    "工具 %s 完成 | 耗时=%.2fs | 命中=%d条",
-                    name, time.monotonic() - t0, len(results),
+                    "工具 %s 完成 | 耗时=%.2fs | 命中=%s",
+                    name, time.monotonic() - t0,
+                    f"{len(vision_text)}字" if vision_text else f"{len(results)}条",
                 )
 
                 messages.append(
                     {"role": "tool", "tool_call_id": call_id, "content": tool_content}
                 )
+
+        # 收尾：产出本轮全部模型调用（决策 + 生成）的 token 用量汇总，
+        # 由路由层聚合并换算成本后随 done 事件发给前端
+        if usage_total["total_tokens"]:
+            logger.info(
+                "本轮 token 用量 | 入=%d 出=%d 共=%d | 模型调用=%d次",
+                usage_total["prompt_tokens"], usage_total["completion_tokens"],
+                usage_total["total_tokens"], llm_calls,
+            )
+            yield {
+                "type": "usage",
+                "usage": usage_total,
+                "llm_calls": llm_calls,
+                "model": settings.llm_model,
+            }
 
 
 @lru_cache

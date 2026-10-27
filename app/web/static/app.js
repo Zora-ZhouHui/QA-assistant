@@ -328,18 +328,18 @@ function logSceneStart(label) {
   visionStep = { el: step, start: performance.now() };
 }
 
-// 图片解析完成：收起进行中标记，补上耗时
-function logVisionDone() {
+// 图片解析完成：收起进行中标记，补上耗时；cached 为 true 时标注缓存命中（0 tokens）
+function logVisionDone(cached) {
   if (!visionStep) return;
   const { el, start } = visionStep;
   const secs = ((performance.now() - start) / 1000).toFixed(1);
   el.classList.remove('running');
   el.classList.add('ok');
   el.querySelector('.log-node').classList.remove('spin');
-  el.querySelector('.log-action').textContent = '图片解析完成';
+  el.querySelector('.log-action').textContent = cached ? '图片解析完成 · 缓存命中' : '图片解析完成';
   const meta = document.createElement('div');
   meta.className = 'log-meta';
-  meta.textContent = `解析耗时 ${secs}s`;
+  meta.textContent = cached ? `缓存命中 · 未调用视觉模型（0 tokens）` : `解析耗时 ${secs}s`;
   el.appendChild(meta);
   visionStep = null;
   logListEl.scrollTop = logListEl.scrollHeight;
@@ -389,15 +389,28 @@ function finalizeLlmStep(kind, basis) {
 function logToolStart(kind, query) {
   toolSeq += 1;
   const step = appendStep('running');
-  const label = kind === 'kb' ? '本地检索' : '联网搜索';
+  const label = kind === 'kb' ? '本地检索' : kind === 'vision' ? '查看截图' : '联网搜索';
   step.innerHTML =
     '<span class="log-node spin"></span>' +
     '<div class="log-head">' +
     `<span class="log-kind ${kind}">#${toolSeq} ${label}</span>` +
     `<span class="log-time">${nowTime()}</span></div>` +
-    `<div class="log-query">检索词 <code>${escapeHtml(query || '')}</code></div>` +
+    `<div class="log-query">${kind === 'vision' ? '追问' : '检索词'} <code>${escapeHtml(query || '')}</code></div>` +
     '<div class="log-meta">执行中…</div>';
   activeToolStep = { el: step, start: performance.now(), kind };
+}
+
+// 跨轮图片追问完成：结果直接回灌模型、不占资料编号，只报提取字符数与耗时
+function logVisionLookupDone(chars) {
+  if (!activeToolStep) return;
+  const { el, start } = activeToolStep;
+  const secs = ((performance.now() - start) / 1000).toFixed(1);
+  el.classList.remove('running');
+  el.classList.add('ok');
+  el.querySelector('.log-node').classList.remove('spin');
+  el.querySelector('.log-meta').textContent = `提取 ${chars || 0} 字 · 耗时 ${secs}s`;
+  activeToolStep = null;
+  logListEl.scrollTop = logListEl.scrollHeight;
 }
 
 function _domain(url) {
@@ -507,6 +520,17 @@ function logAnswerDone() {
     const step = appendStep('info');
     step.innerHTML = `<span class="log-node"></span><div class="log-meta">本轮总耗时 ${total}s${summary ? ' · ' + summary : ''}</div>`;
   }
+  logListEl.scrollTop = logListEl.scrollHeight;
+}
+
+// 本轮 token 用量与成本（done 事件携带）：token 为账单口径精确值；
+// 后端未配单价时 cost 为 null，只显示 token 数
+function logUsage(usage, cost) {
+  if (!usage || !usage.total_tokens) return;
+  let text = `本轮消耗 ${usage.total_tokens} tokens（入 ${usage.prompt_tokens} / 出 ${usage.completion_tokens}）`;
+  if (typeof cost === 'number') text += ` · 约 ¥${cost.toFixed(4)}`;
+  const step = appendStep('info');
+  step.innerHTML = `<span class="log-node"></span><div class="log-meta">${text}</div>`;
   logListEl.scrollTop = logListEl.scrollHeight;
 }
 
@@ -907,6 +931,22 @@ function renderTrace(events) {
         `<span class="log-kind ${kind}">${label}</span></div>` +
         `<div class="log-query">检索词 <code>${escapeHtml(evt.query || '')}</code></div>` +
         '<div class="log-meta">执行中…</div>';
+    } else if (evt.type === 'vision_lookup') {
+      if (modelEl) relabelModel(`第 ${modelCall} 次调用 · 决策：调用工具`);
+      toolEl = appendStep('running');
+      toolEl.innerHTML =
+        '<span class="log-node spin"></span>' +
+        '<div class="log-head"><span class="log-kind vision">查看截图</span></div>' +
+        `<div class="log-query">追问 <code>${escapeHtml(evt.query || '')}</code></div>` +
+        '<div class="log-meta">执行中…</div>';
+    } else if (evt.type === 'vision_lookup_done') {
+      if (toolEl) {
+        toolEl.classList.remove('running');
+        toolEl.classList.add('ok');
+        toolEl.querySelector('.log-node').classList.remove('spin');
+        toolEl.querySelector('.log-meta').textContent = `提取 ${evt.chars || 0} 字`;
+      }
+      toolEl = null;
     } else if (evt.type === 'sources' || evt.type === 'web_sources') {
       fillToolDone(toolEl, evt.type === 'web_sources' ? 'web' : 'kb', evt.documents || []);
       toolEl = null;
@@ -1050,7 +1090,7 @@ async function sendQuestion(scene) {
         } else if (evt.type === 'vision_done') {
           // 解析结束：thinking 恢复为"思考中…"，进入 Agent 工具循环
           if (thinking) thinking.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span> 思考中';
-          logVisionDone();
+          logVisionDone(evt.cached);
         } else if (evt.type === 'llm_start') {
           // 上一次调用若无工具事件收尾，则它必然以生成告终（循环无工具调用即结束）
           finalizeLlmStep('generation', basisText());
@@ -1072,6 +1112,12 @@ async function sendQuestion(scene) {
           // 该次模型调用以调用工具告终 → 定型为决策；右侧日志：联网搜索开始
           finalizeLlmStep('decision');
           logToolStart('web', evt.query);
+        } else if (evt.type === 'vision_lookup') {
+          // 跨轮图片追问：Agent 决定重看本会话此前的截图
+          finalizeLlmStep('decision');
+          logToolStart('vision', evt.query);
+        } else if (evt.type === 'vision_lookup_done') {
+          logVisionLookupDone(evt.chars);
         } else if (evt.type === 'web_sources') {
           // 右侧日志：联网搜索完成
           logToolFinish(evt.documents, 'web');
@@ -1106,6 +1152,7 @@ async function sendQuestion(scene) {
           finalizeLlmStep('generation', basisText());
           removeThinking();
           logAnswerDone();
+          logUsage(evt.usage, evt.cost);
           // 最终完整渲染一次，保证闭合状态正确
           if (fullText) answerEl.innerHTML = renderAnswerHTML(fullText, sourcesCount, true);
           // 回答结束，刷新会话列表（标题可能从"新会话"变为首条问题）

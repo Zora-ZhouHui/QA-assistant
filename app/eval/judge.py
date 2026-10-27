@@ -8,6 +8,7 @@
   judge_faithfulness    回答是否只陈述资料支撑的事实
   judge_relevancy_questions  由回答反推它能回答的问题（供向量相似度算 Answer Relevancy）
   judge_citation        逐句判定引用是否支撑（供 Citation Precision / Recall）
+  judge_fact_coverage   视觉解析文本是否覆盖了 gold 事实点（供视觉解析 Fact Recall）
 
 裁判输出一律强制 JSON；解析失败时抛 ValueError，由上层记为失败样本并跳过，绝不捏造分数。
 """
@@ -117,3 +118,40 @@ async def judge_citation(answer: str, context_text: str) -> List[Dict[str, Any]]
     if not isinstance(statements, list):
         raise ValueError(f"citation 裁判返回结构异常：{data!r}")
     return statements
+
+
+_FACT_COVERAGE_PROMPT = """你是严格的信息抽取裁判。给定一段「图片解析文本」和若干「事实点」，逐条判断该事实点是否被解析文本覆盖。
+
+判定标准：事实点的关键信息（文字内容、数值、名称）在解析文本中明确出现或可由原文直接推出，记 covered=true；解析文本完全未提及、或只提到相关主题但缺少该事实点的关键信息，记 covered=false。
+
+只输出 JSON 数组，不要输出任何其他文字：
+[{{"fact": "事实点原文", "covered": true}}]   # covered 为 true 或 false
+
+<图片解析文本>
+{parsed}
+
+<事实点>
+{facts}"""
+
+
+async def judge_fact_coverage(parsed_text: str, facts: List[str]) -> List[Dict[str, Any]]:
+    """逐条判定 gold 事实点是否被视觉解析文本覆盖，返回 [{fact, covered}]。
+
+    覆盖数 / 事实点总数即该样本的 Fact Recall（由调用方聚合）。
+    """
+    facts_text = "\n".join(f"{i}. {f}" for i, f in enumerate(facts, 1))
+    text = await call_llm([
+        {"role": "user", "content": _FACT_COVERAGE_PROMPT.format(parsed=parsed_text, facts=facts_text)},
+    ])
+    rows = parse_json(text)
+    if not isinstance(rows, list):
+        raise ValueError(f"fact_coverage 裁判返回的不是数组：{rows!r}")
+    # 裁判可能漏判/多判：以 gold 事实点为准对齐，漏判记 covered=False（保守口径）
+    by_fact = {
+        str(r.get("fact", "")).strip(): bool(r.get("covered"))
+        for r in rows if isinstance(r, dict)
+    }
+    return [
+        {"fact": f, "covered": by_fact.get(f.strip(), False)}
+        for f in facts
+    ]

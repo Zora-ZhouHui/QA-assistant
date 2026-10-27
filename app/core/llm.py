@@ -64,17 +64,24 @@ class LLMClient:
         """流式对话，产出事件流：
           {"type": "token", "content": str}        —— 回答文本增量
           {"type": "tool_calls", "calls": [...]}   —— 流结束时模型请求调用工具
+          {"type": "usage", "usage": {...}, "model": str} —— 本次调用的 token 用量
 
         tools 为 None 时等价纯文本流，永远不会产生 tool_calls 事件。
 
         流式协议下 tool_calls 是分片到达的（按 index 增量拼 arguments），
         这里负责拼装成完整的标准结构，调用方（agent loop）无需感知分片细节。
+
+        token 计量：stream_options.include_usage 让厂商在流的最后一个 chunk
+        返回精确 usage（账单口径）；该 chunk 的 choices 为空，须在分片循环里
+        单独捕获，流结束后以 usage 事件产出。
         """
         client = self._ensure_client(base_url, api_key)
+        model_id = model or settings.llm_model
         kwargs: Dict[str, Any] = {
-            "model": model or settings.llm_model,
+            "model": model_id,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
             "temperature": 0.3,  # 知识问答场景调低温度，减少发挥
             # 百炼系模型（qwen3.7-plus 等）默认开启思考模式：思考内容走 reasoning_content
             # 字段（本客户端只消费 content，会静默丢弃），且思考 token 按输出计费。
@@ -87,7 +94,16 @@ class LLMClient:
 
         # 流式 tool_calls 分片拼装：index → {id, name, arguments 增量累加}
         tool_acc: Dict[int, Dict[str, str]] = {}
+        usage_seen: Optional[Dict[str, int]] = None
         async for chunk in response:
+            # usage 挂在末个 chunk 上（choices 为空），先捕获再走 choices 判断
+            if getattr(chunk, "usage", None):
+                u = chunk.usage
+                usage_seen = {
+                    "prompt_tokens": u.prompt_tokens or 0,
+                    "completion_tokens": u.completion_tokens or 0,
+                    "total_tokens": u.total_tokens or 0,
+                }
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -108,6 +124,8 @@ class LLMClient:
                         slot["arguments"] += tc.function.arguments
 
         # 以"是否真的收到过分片"为准（部分兼容层的 finish_reason 不规范）
+        if usage_seen:
+            yield {"type": "usage", "usage": usage_seen, "model": model_id}
         if tool_acc:
             calls = [
                 {

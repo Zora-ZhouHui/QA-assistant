@@ -8,8 +8,8 @@
 | 差异化 | 截图问答：上传前端截图（控制台报错 / 布局错位 / 设计稿对比）→ 多模态解析成纯文本 → 复用同一套 Agent 检索链路 |
 | 架构   | 四层依赖单向隔离，编排层不感知厂商与引擎，换模型只改 `.env`                       |
 | 数据   | 1293 道 Agent 面试题库 + 本地文档 + Tavily 联网，Chroma 双表统一检索  |
-| 可观测 | 决策 / 生成分离的模型调用轨迹，SSE 事件流实时映射成可折叠时间线                     |
-| 评测   | 检索 / 生成 / 引用三层评测，L4 激进改写 Recall@1 84%（随机下界 0.08%）         |
+| 可观测 | 决策 / 生成分离的模型调用轨迹，SSE 事件流实时映射成可折叠时间线；逐轮 token 用量与成本计量                     |
+| 评测   | 检索 / 生成 / 引用 / 视觉解析四层评测，L4 激进改写 Recall@1 84%（随机下界 0.08%）         |
 
 clone 即用：题库随仓库发布，无需任何外部数据库或 Node 构建，首次启动自动建库。
 
@@ -139,9 +139,11 @@ sources             本地检索结果（含编号、来源、相似度）
 searching           模型决定联网搜索（含搜索词）
 web_sources         联网搜索结果（编号接续本地结果）
 search_failed       检索失败/空结果（模型将据此降级作答）
+vision_lookup       跨轮追问截图细节：模型决定重看本会话此前的截图（含追问词）
+vision_lookup_done  重看完成（含定向提取的字符数）
 token …             回答文本增量（可能穿插在多轮工具调用之后）
 error               出错信息（格式非法 / 未配模型 / 解析为空 等硬失败）
-done                本轮结束
+done                本轮结束（含 usage：逐轮 token 用量与模型调用次数；配好 MODEL_PRICES 时带 cost）
 ```
 
 </details>
@@ -156,10 +158,11 @@ roma-assistant/
 │   ├── agent/                   # —— Agent 编排层 ——
 │   │   ├── loop.py              #   ReAct 工具循环：流式决策 → 执行工具 → 再决策 → 生成
 │   │   ├── prompts.py           #   系统提示词（五路分流规则 + 当前日期注入 + 截图场景）
-│   │   └── tools/               #   工具注册表：schema + 执行器（kb_search / web_search）
+│   │   └── tools/               #   工具注册表：schema + 执行器（kb_search / web_search / vision_lookup）
 │   ├── core/                    # —— 基础设施层 ——
 │   │   ├── contracts.py         #   跨层契约（SessionMemory 等 dataclass，避免循环依赖）
-│   │   ├── llm.py               #   OpenAI 兼容客户端：流式 tool_calls 分片拼装
+│   │   ├── llm.py               #   OpenAI 兼容客户端：流式 tool_calls 分片拼装 + usage 采集
+│   │   ├── usage.py             #   token 用量 → 成本换算（MODEL_PRICES 单价映射）
 │   │   ├── embeddings.py        #   bge 本地模型封装（query 端带检索指令 + 换模型检测）
 │   │   └── vectorstore.py       #   Chroma 封装：docs/faq 双表 + 跨表合并排序 + 全量遍历
 │   ├── services/                # —— 业务服务层 ——
@@ -188,9 +191,12 @@ roma-assistant/
 │   │   ├── run_retrieval_v2.py  #   检索评测：难度分级 + 下界基线 + 判别力小结
 │   │   ├── run_generation.py    #   生成层评测（Faithfulness / Answer Relevancy）
 │   │   ├── run_citation.py      #   引用层评测（Citation Precision / Recall）
+│   │   ├── run_vision.py        #   视觉解析层评测（Fact Recall，按场景分组）
 │   │   └── README.md            #   评测体系专项文档（含评测口径说明）
 │   ├── api/                     # 路由：chat(SSE) / sessions / documents
 │   └── web/static/              # 前端三栏界面（app.js / index.html / style.css）
+├── scripts/
+│   └── measure_vision_tokens.py # 多模态 token 成本量化：图片 vs 文本问题实测对比
 ├── data/
 │   └── faqs.json                # ★ 随仓库发布的题库：3 个数据源共 1293 道 FAQ
 ├── requirements.txt
@@ -248,6 +254,8 @@ uvicorn app.main:app --reload
 | `TOP_K`             | `4`                         | 每次检索最终返回的片段数                           |
 | `RETRIEVAL_MODE`    | `dense`                     | `dense`=纯向量单路（默认，评测最强）；`hybrid`=稠密 + BM25 稀疏扩池 |
 | `RERANK_ENABLED`    | `false`                     | 是否启用 Cross-Encoder 重排；默认关闭（本语料实测负收益）      |
+| `MODEL_PRICES`      | 空（只计 token 不计成本）        | 模型单价表（元/1M tokens，JSON）；配好后 done 事件带 cost，前端日志显示 ¥ |
+| `VISION_CACHE_ENABLED` | `true`                   | 图片解析缓存：同图+同场景+同说明命中 sha256 缓存，跳过视觉模型调用（0 tokens） |
 
 ## 数据集与自定义知识
 
@@ -352,11 +360,17 @@ class SceneSpec:
 
 旧版是三份平行 `Dict[str, str]`（key 必须处处一致，加一个场景要改三处）；合并为 `SceneSpec` 后，新增/修改/删除场景只有 `SCENES` 表一处，**单一事实源**。
 
+**解析缓存**：图片 token 成本远高于文本（实测平均约 733 tokens/张，约为一条 20 字中文问题的 24 倍，测量脚本 `scripts/measure_vision_tokens.py`），同图重复解析是纯浪费。缓存 key = 逐张图片 sha256（按上传顺序）+ 场景 + 补充说明，命中即直接返回缓存文本、跳过视觉模型调用（本轮图片解析 0 tokens，`vision_done` 事件标 `cached`）；改图即换 key，不会返回旧图结果。
+
+**跨轮图片追问（vision_lookup）**：用户第 N 轮传截图、第 N+k 轮追问"图里第 3 行那个报错码是什么"时，工作窗口里只有当初的解析文本，未覆盖的细节答不了。`vision_lookup` 工具把会话中最近的截图重新交给视觉模型，带着追问定向提取细节后回灌 Agent 循环。它是**会话态工具**：依赖 session_id 找图，不能放进全局工具注册表，由 `loop.py` 每次请求时检查——只有本会话确实存在过截图才动态注入 schema 与执行器，空会话不无谓暴露工具。提示词侧同步：仅当工具可用时追加"跨轮图片追问"规则（解析未覆盖必须先重看、禁止凭通用知识猜测）。
+
 **为什么视觉解析是硬失败，不降级？** 检索/联网失败遵循"降级哲学"（错误文本回灌给模型，模型基于自身知识收尾并声明未能联网核实）。但视觉解析是本项目中**唯一刻意走硬失败**的环节——没配视觉模型、场景不在注册表、图片格式非法、解析返回空内容，任何一种都直接发 `error` 事件让用户重试，**不静默降级**。原因是：图片没有"降级成文字"的自然路径，让 VisionParser 自己抛异常（`RuntimeError` 表示未配模型、`ValueError` 表示未知场景）比"悄悄跳过图片只按补充说明回答"更诚实。
 
 ### 8. 可观测：把 Agent 的"思考过程"做成产品
 
 右侧执行日志与问答过程严格同步：每次模型调用先显示"推理中"，后续事件再把它**定型**为"决策：调用工具"或"开始生成回答"；每个工具步骤展示检索词、命中条数、耗时，可展开查看返回的每条资料标题；回答结束后给出本轮总耗时与"模型调用 N 次（决策 M + 生成 1）"的统计。这套可视化的本质是把后端 SSE 事件流一帧不落地映射成时间线，对理解和调试 Agent 行为非常直观。
+
+**token 成本计量**：流式请求开启 `stream_options.include_usage`，每次模型调用（决策 + 生成 + 视觉解析）的精确 usage 逐次累加，SSE `done` 事件带本轮 `prompt/completion/total tokens` 与 `llm_calls`；单价接口不返回，用 `.env` 可配置的 `MODEL_PRICES`（模型名 → 入/出单价 JSON）换算成本，前端日志最后一行显示"本轮消耗 X tokens（入Y/出Z）· 约¥x.xxxx"。未配价格时只显示 token 数，**绝不捏造成本**。
 
 ## 评测体系
 
@@ -367,6 +381,7 @@ class SceneSpec:
 | 检索层 | 检索能否把正确资料排在前面、并区分语义相近的干扰项 | `run_retrieval_v2.py` | Recall\@1 / Recall\@K / MRR / nDCG\@K / 单选选对率 |
 | 生成层 | 回答是否忠实于资料、是否切题            | `run_generation.py`   | Faithfulness / Answer Relevancy               |
 | 引用层 | 引用是否真的支撑对应陈述              | `run_citation.py`     | Citation Precision / Recall                   |
+| 视觉解析层 | 图→文解析是否把答题所需的关键事实点提取出来  | `run_vision.py`       | Fact Recall（micro / macro / 按场景分组）           |
 
 生成层与引用层借鉴 RAGAS 思路，用另一个 LLM 当裁判（`judge.py`），对「回答 + 资料 + 问题」给出结构化判定；裁判输出强制 JSON，解析失败记失败样本并跳过，绝不捏造分数。
 
@@ -411,6 +426,16 @@ python -m app.eval.run_retrieval_v2 --top-k 4              # 评测（无需 LLM
 - 重排关闭时 `hybrid` 与 `dense` 对 top_k 结果等价（稀疏扩池的候选余弦分永远进不了 top-4），因此默认 `dense` 避免无谓的 BM25 构建与查询开销；
 - 未来若上 GPU、或换更强的多语言重排器，可用已有评测框架（`--pipeline hybrid_rerank`）重新验证，届时再决定是否启用。
 
+### 视觉解析层评测：Fact Recall
+
+多模态"图→文"适配器同样有独立评测（`run_vision.py` + `judge.py` 的 `judge_fact_coverage`）：给每条样本标注"回答该问题所需的关键事实点"（gold_facts），解析后用 LLM 裁判逐条判定事实点是否被解析文本覆盖（漏判记未覆盖，保守口径），聚合 micro（全量事实点）/ macro（按样本平均）并按场景分组。评测期间强制关闭解析缓存——测的是模型解析能力，不是缓存命中。
+
+种子集（6 样本，qwen3.7-plus）实测：Fact Recall micro 80.77% / macro 81.67%；分场景看 **console_error 100%（8/8），layout_misalign 72.22%（13/18）**——评测直接暴露了布局场景的事实遗漏问题（如容器尺寸数值漏提取），这正是扩充标注集与调优场景提示词的依据。当前样本量小（n=6），指标仅作框架验证，扩标注后才有选型结论意义。
+
+```bash
+python -m app.eval.run_vision   # 需 LLM_API_KEY 与 VISION_MODEL；结果落盘 data/eval_runs/
+```
+
 ## API 一览
 
 | 方法       | 路径                                    | 说明                                                                      |
@@ -431,5 +456,5 @@ python -m app.eval.run_retrieval_v2 --top-k 4              # 评测（无需 LLM
 - **运行期热加载**：知识文件在启动时扫描入库，运行中新增文件需要重启（增量同步成本低，但未做 watcher）。
 - **重排默认关闭（待强模型验证）**：完整管线（dense + BM25 扩池 + Cross-Encoder 重排）已实现，但评测显示轻量 `bge-reranker-base` 弱于纯稠密、更强的 `bge-reranker-v2-m3` 在 CPU 上不可接受，故默认 `RERANK_ENABLED=false`；上 GPU / 换更强重排器后可重新评测启用（详见[检索管线演进](#检索管线演进dense--hybrid--hybridrerank)）。
 - **模型需支持 OpenAI 标准 function calling**；极小众兼容层可能存在流式协议差异（代码已对 finish\_reason 不规范做兜底）。
-- **多模态限制**：截图问答仅接受 dataURL（不支持远程 URL 或本地路径）；图片只在当前这一次"截图→解析→回答"链路中使用，跨轮不带图片；无 OCR 兜底（完全依赖视觉模型的中文理解能力）。
+- **多模态限制**：截图问答仅接受 dataURL（不支持远程 URL 或本地路径）；跨轮追问通过 `vision_lookup` 重看的是会话中**最近一次**的截图（更早的截图不回看）；无 OCR 兜底（完全依赖视觉模型的中文理解能力）。
 - **运行时扫描根目录**：`data/` 同时作为知识文件目录与爬虫缓存目录，当前只靠后缀白名单区分，未来缓存目录迁移或加入显式排除后更干净。

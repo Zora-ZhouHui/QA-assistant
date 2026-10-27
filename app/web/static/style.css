@@ -1172,6 +1172,11 @@ a.source-name:hover,
   color: var(--accent);
 }
 
+.log-kind.vision {
+  background: #ede9fe;
+  color: #6d28d9;
+}
+
 .log-kind.question,
 .log-kind.model {
   background: var(--card);

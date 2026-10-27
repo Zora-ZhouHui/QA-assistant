@@ -29,10 +29,15 @@ AGENT_SYSTEM_PROMPT = """你是 Roma 智能助手，可结合"对话历史"、�
 
 7. 截图场景。用户上传截图时，系统已先用多模态模型把图片按场景解析成文字（报错信息/错误栈、布局方式/偏移量、视觉差异），你拿到的就是这段文字，按普通问题处理即可——结合本地知识库与联网资料给出定位与修复建议。历史消息中出现的〔本轮附 N 张截图〕只是提示该轮有截图，其内容已在对应文字里，无需再索取图片。"""
 
+# 仅当会话中确实存在此前截图时追加的规则（此时 vision_lookup 工具可用）
+SESSION_IMAGES_RULE = """
+8. 跨轮图片追问。本会话此前有用户上传过截图，vision_lookup 工具当前可用。当用户追问截图中的细节（报错码、数值、元素文字、界面标签等），而对话历史里的图→文解析文本没有覆盖该细节时，必须先调用 vision_lookup 带着追问重看截图，再基于其返回作答——禁止凭浏览器/前端通用知识猜测图中内容，也禁止让用户重发截图；解析文本已覆盖的内容直接作答，不要重复调用。"""
+
 
 def build_system_messages(
     question: str,
     memory: Optional[SessionMemory] = None,
+    has_session_images: bool = False,
 ) -> List[Dict[str, Any]]:
     """组装初始消息：系统提示词 + 历史摘要 + 近轮原文 + 当前问题。
 
@@ -42,11 +47,15 @@ def build_system_messages(
 
     question 为纯文本：文字问答时是用户原问题；截图问答时是"图 → 文"的多模态
     解析结果（在 routes_chat.py 中先解析、再作为问题传入）。本函数不感知多模态。
+
+    has_session_images=True 时追加规则 8（vision_lookup 使用时机），
+    与 loop.py 注入工具 schema 的条件保持一致。
     """
     # 注入当前日期，避免模型用训练截止时的旧年份生成时效类搜索词
     today = datetime.now().strftime("%Y年%m月%d日")
+    base_prompt = AGENT_SYSTEM_PROMPT + (SESSION_IMAGES_RULE if has_session_images else "")
     system_prompt = (
-        f"{AGENT_SYSTEM_PROMPT}\n\n今天是 {today}。"
+        f"{base_prompt}\n\n今天是 {today}。"
         '涉及"今天""最近""最新"等时效表述时，按此日期计算。'
     )
 

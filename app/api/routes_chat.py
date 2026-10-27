@@ -10,6 +10,8 @@
     sources      —— 知识库检索到的参考资料（编号已分配）
     searching    —— Agent 正在联网搜索（含搜索词）
     web_sources  —— 联网搜到的网页资料（编号接续 sources 之后）
+    vision_lookup      —— Agent 正在重看本会话此前的截图（跨轮图片追问）
+    vision_lookup_done —— 重看完成（含提取字符数）
     token        —— 回答的一个片段
     error        —— 出错信息
     done         —— 回答结束
@@ -37,6 +39,7 @@ from pydantic import BaseModel, Field
 
 from app.agent import get_agent_service
 from app.config import settings
+from app.core.usage import compute_cost
 from app.services.memory import get_memory_service
 from app.services.vision import SCENES, get_vision_parser
 
@@ -109,6 +112,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
 
         # 截图问答：VisionParser 把图片按场景指令流式解析成纯文本（图→文）。
         # 解析完成后把文本作为问题接入下面的 Agent 工具循环，不改动任何检索逻辑。
+        vision_usage = None  # 图片解析那一步的 token 用量（含 model），done 时并入汇总
         if images:
             spec = SCENES[scene]
             yield emit({"type": "vision_start", "scene": scene, "label": spec.label})
@@ -133,6 +137,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             if not analysis:
                 yield _sse({"type": "error", "message": "图片解析未返回内容，请更换截图后重试"})
                 return
+            vision_usage = parser.last_usage
 
             # 直接作答场景（如设计稿对比）：视觉解析结果即最终答案，跳过 Agent/RAG。
             # 其余场景：解析文本 + 按场景的追问句（驱动模型调用检索工具），补充说明可选追加。
@@ -150,6 +155,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                     "scene": scene,
                     "label": spec.label,
                     "question": rag_question,
+                    "cached": parser.cache_hit,
                 }
             )
             # 日志/回放里的"提问"节点用场景名（解析全文已在用户消息中展示，避免重复堆叠）
@@ -170,13 +176,16 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # 直接作答省掉向量检索等待。收集完整回答用于落库。
         # 直接作答场景（如设计稿对比）跳过该循环：视觉对比文本即最终回答。
         full_answer: list = []
+        agent_usage = None       # Agent 循环的 token 用量汇总（含 llm_calls / model）
+        lookup_usages: list = []  # vision_lookup 重看截图的逐次用量（独立视觉调用）
         if direct_answer:
             full_answer.append(rag_question)
             yield _sse({"type": "token", "content": rag_question})
         else:
             try:
                 async for event in agent.run_stream(
-                    rag_question, memory, req.web_search_enabled
+                    rag_question, memory, req.web_search_enabled,
+                    session_id=req.session_id,
                 ):
                     if event["type"] == "token":
                         full_answer.append(event["content"])
@@ -187,10 +196,22 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                         yield emit({"type": "kb_searching", "query": event["query"]})
                     elif event["type"] == "searching":
                         yield emit({"type": "searching", "query": event["query"]})
-                    elif event["type"] == "sources":
-                        yield emit({"type": "sources", "documents": event["documents"]})
-                    elif event["type"] == "web_sources":
-                        yield emit({"type": "web_sources", "documents": event["documents"]})
+                    elif event["type"] == "vision_lookup":
+                        yield emit({"type": "vision_lookup", "query": event["query"]})
+                    elif event["type"] == "vision_lookup_done":
+                        # usage 只在内部聚合（缓存命中为 None 自动跳过），不透传前端
+                        if event.get("usage"):
+                            lookup_usages.append(event["usage"])
+                        yield emit(
+                            {
+                                "type": "vision_lookup_done",
+                                "query": event["query"],
+                                "chars": event["chars"],
+                            }
+                        )
+                    elif event["type"] == "usage":
+                        # 只在内部聚合，不透传：用量随 done 事件一次性下发
+                        agent_usage = event
                     elif event["type"] == "search_failed":
                         yield emit(
                             {
@@ -217,9 +238,39 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             mem_service.append(req.session_id, "user", rag_question)
         mem_service.append(req.session_id, "assistant", "".join(full_answer))
 
-        # 后台触发压缩（超阈值才真正压缩），不阻塞本次 SSE 返回
+        # 后台触发压缩（超阈值才真正压缩），不阻塞本次 SSE 返回。
+        # 注：压缩在 SSE 关闭后异步执行，其 token 用量无法并入本轮 done，有意排除。
         asyncio.create_task(mem_service.maybe_compress(req.session_id))
 
-        yield _sse({"type": "done"})
+        # done 事件携带本轮 token 用量与成本：token 数取接口 usage（账单口径），
+        # 成本按 config.model_prices 单价表换算；任一环节缺单价则 cost=None（不捏造）。
+        done_payload: dict = {"type": "done"}
+        steps = []  # (usage, model) 按环节拆分，成本须分模型各自换算后再相加
+        if vision_usage:
+            steps.append((vision_usage, vision_usage.get("model", "")))
+        for lu in lookup_usages:
+            steps.append((lu, lu.get("model", "")))
+        if agent_usage:
+            steps.append((agent_usage["usage"], agent_usage.get("model", "")))
+        if steps:
+            total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            cost = 0.0
+            cost_available = True
+            for usage, model in steps:
+                for k in total:
+                    total[k] += usage.get(k, 0)
+                c = compute_cost(model, usage)
+                if c is None:
+                    cost_available = False
+                else:
+                    cost += c
+            total["llm_calls"] = (
+                (agent_usage or {}).get("llm_calls", 0)
+                + (1 if vision_usage else 0)
+                + len(lookup_usages)
+            )
+            done_payload["usage"] = total
+            done_payload["cost"] = round(cost, 6) if cost_available else None
+        yield _sse(done_payload)
 
     return StreamingResponse(generate(), media_type="text/event-stream")

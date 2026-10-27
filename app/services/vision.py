@@ -8,10 +8,25 @@
 "哪些事件落 trace、哪些只透传前端"这类 SSE 契约留在路由层，视觉模块不感知前端。
 """
 from dataclasses import dataclass
-from typing import AsyncGenerator, Dict, List
+import hashlib
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from app.config import settings
 from app.core.llm import get_llm_client
+
+
+def _cache_key(images: List[str], scene: str, note: str) -> str:
+    """缓存 key：图片内容（逐张 sha256，按上传顺序）+ 场景 + 补充说明。
+
+    图片内容本身参与哈希——改图即换 key，不会返回旧图的解析结果。
+    """
+    h = hashlib.sha256()
+    for u in images:
+        h.update(hashlib.sha256(u.encode()).digest())
+    h.update(scene.encode())
+    h.update(b"\x00")
+    h.update(note.encode())
+    return h.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -58,6 +73,17 @@ SCENES: Dict[str, SceneSpec] = {
 }
 
 
+# 跨轮追问"重看截图"的解析指令：不进 SCENES——它不是用户选的入口场景，
+# 而是 Agent 工具循环里 vision_lookup 工具的专用提示词，聚焦"带着问题回图中找证据"。
+LOOKUP_PROMPT = (
+    "你是截图细节解读助手。针对用户的问题，从这些截图中寻找相关证据："
+    "逐字提取相关文字（报错信息、错误码、样式数值、元素文本等），并说明其在图中的"
+    "位置与状态；若截图内容与问题无关，明确说明。输出纯文本，不要寒暄。"
+)
+LOOKUP_SCENE = "detail_lookup"  # 缓存 key 的场景分量（与入口场景隔离）
+LOOKUP_MAX_CHARS = 3000         # 回灌模型的重看结果上限，避免超长截图描述挤爆上下文
+
+
 class VisionParser:
     """图→文解析器。
 
@@ -70,6 +96,11 @@ class VisionParser:
 
     def __init__(self):
         self._llm = get_llm_client()
+        # 最近一次解析的 token 用量（含 model），由路由层读取后并入 done 事件；
+        # 每次 stream_parse 开头重置，避免串轮
+        self.last_usage: Optional[Dict[str, Any]] = None
+        # 最近一次解析是否命中缓存（路由层据此在 vision_done 事件里标记 cached）
+        self.cache_hit: bool = False
 
     async def stream_parse(
         self,
@@ -108,6 +139,22 @@ class VisionParser:
             }
         ]
 
+        self.last_usage = None
+        self.cache_hit = False
+
+        # 解析缓存：同图 + 同场景 + 同补充说明 → 直接返回缓存文本，跳过视觉模型调用。
+        # 命中时 last_usage 保持 None——本轮图片解析 0 tokens，done 事件如实反映。
+        cache_path = None
+        if settings.vision_cache_enabled:
+            cache_path = settings.vision_cache_dir / f"{_cache_key(images, scene, note)}.txt"
+            if cache_path.exists():
+                cached = cache_path.read_text(encoding="utf-8").strip()
+                if cached:
+                    self.cache_hit = True
+                    yield cached
+                    return
+
+        parts: List[str] = []
         async for ev in self._llm.stream_chat_with_tools(
             messages,
             tools=None,
@@ -116,7 +163,79 @@ class VisionParser:
             api_key=settings.vision_api_key,
         ):
             if ev["type"] == "token":
+                parts.append(ev["content"])
                 yield ev["content"]
+            elif ev["type"] == "usage":
+                self.last_usage = {**ev["usage"], "model": ev.get("model", settings.vision_model)}
+
+        # 只缓存非空结果（空结果由路由层拦截报错，不该被缓存放大成"永久空"）
+        if cache_path is not None and parts:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text("".join(parts), encoding="utf-8")
+
+    async def stream_lookup(
+        self,
+        images: List[str],
+        question: str,
+    ) -> AsyncGenerator[str, None]:
+        """跨轮追问重看截图：带着问题从图片中定向提取细节，逐段 yield 文本。
+
+        与 stream_parse 的区别：提示词是通用的"找证据"指令（非场景化），
+        它是 Agent 工具循环的中间产物，不是给用户看的最终答案；回灌长度上限
+        （LOOKUP_MAX_CHARS）由工具执行器在拼合全文后统一截断。用量照常记入
+        last_usage（由工具执行器透传给路由层并入本轮汇总）。
+        """
+        if not settings.vision_model:
+            raise RuntimeError(
+                "未配置视觉模型（VISION_MODEL），无法识别图片。"
+            )
+
+        text = LOOKUP_PROMPT
+        if question:
+            text = f"{text}\n\n用户问题：{question}"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                    *[{"type": "image_url", "image_url": {"url": u}} for u in images],
+                ],
+            }
+        ]
+
+        self.last_usage = None
+        self.cache_hit = False
+
+        # 与入口解析共用缓存：同图 + 同追问 → 直接命中（场景分量用 LOOKUP_SCENE 隔离）
+        cache_path = None
+        if settings.vision_cache_enabled:
+            cache_path = settings.vision_cache_dir / f"{_cache_key(images, LOOKUP_SCENE, question)}.txt"
+            if cache_path.exists():
+                cached = cache_path.read_text(encoding="utf-8").strip()
+                if cached:
+                    self.cache_hit = True
+                    yield cached
+                    return
+
+        parts: List[str] = []
+        async for ev in self._llm.stream_chat_with_tools(
+            messages,
+            tools=None,
+            model=settings.vision_model,
+            base_url=settings.vision_base_url,
+            api_key=settings.vision_api_key,
+        ):
+            if ev["type"] == "token":
+                parts.append(ev["content"])
+                yield ev["content"]
+            elif ev["type"] == "usage":
+                self.last_usage = {**ev["usage"], "model": ev.get("model", settings.vision_model)}
+
+        # 缓存存全文；回灌截断（LOOKUP_MAX_CHARS）由工具执行器统一收口，
+        # 保证首次调用与缓存命中的回灌行为一致
+        if cache_path is not None and parts:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text("".join(parts), encoding="utf-8")
 
 
 def get_vision_parser() -> VisionParser:
